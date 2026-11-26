@@ -2261,3 +2261,599 @@ class CheckpointJournal:
 
     def __exit__(self, *_exc):
         self.close()
+
+
+# --- RetirableJournal: erase one source without replaying others -----------
+# Directory layout (implementation details):
+#   directory/
+#     events/                 authoritative RetainedJournal of descriptors
+#     retirable.json          admitted sources, retirement and pack bases
+#     body-<subject>.bin      raw concatenated bodies for one source
+#     body-<subject>.bin.tmp  staging copy while pruning a body pack
+#
+# The events log never contains body bytes.  A source's bodies are concatenated
+# in append order in its own pack, so retiring that source only unlinks its own
+# files and can never delete another source's identical bytes.  Pruning the
+# consumer prefix compacts each surviving source pack from its first surviving
+# descriptor onward; the descriptor's body offset is stable and retirable.json
+# records the physical base of the compacted pack.
+
+_RETIRE_STATE_NAME = "retirable.json"
+_RETIRE_BODY_TEMPLATE = "body-{}.bin"
+_RETIRE_STATE_VERSION = 1
+_RETIRE_MAX_SUBJECTS = 32
+_RETIRE_MAX_DESCRIPTORS = 8192
+_RETIRE_MAX_LIVE_BYTES = 64 * 1024 * 1024
+_RETIRE_MAX_DATA = 1_000_000
+_RETIRE_READ_LIMIT_MAX = 16
+_RETIRE_SCAN_BATCH = 64
+_RETIRE_COPY_CHUNK = 256 * 1024
+_RETIRE_DESCRIPTOR_HEADER = Struct(">BBQI")
+
+
+@dataclass(frozen=True)
+class RetirableRecord:
+    """One audit event: stable cursor, source, and bytes or retirement marker."""
+
+    offset: int
+    next_offset: int
+    subject: str
+    data: object
+
+
+def _encode_retirable_descriptor(subject, body_offset, body_length):
+    raw_subject = subject.encode("ascii")
+    return (
+        _RETIRE_DESCRIPTOR_HEADER.pack(
+            _RETIRE_STATE_VERSION,
+            len(raw_subject),
+            body_offset,
+            body_length,
+        )
+        + raw_subject
+    )
+
+
+def _decode_retirable_descriptor(payload):
+    if (
+        not isinstance(payload, bytes)
+        or len(payload) < _RETIRE_DESCRIPTOR_HEADER.size
+    ):
+        raise Corruption("malformed retirable descriptor")
+    version, subject_length, body_offset, body_length = (
+        _RETIRE_DESCRIPTOR_HEADER.unpack_from(payload)
+    )
+    if (
+        version != _RETIRE_STATE_VERSION
+        or not 1 <= subject_length <= 32
+        or body_length > _RETIRE_MAX_DATA
+        or len(payload)
+        != _RETIRE_DESCRIPTOR_HEADER.size + subject_length
+    ):
+        raise Corruption("malformed retirable descriptor")
+    try:
+        subject = payload[
+            _RETIRE_DESCRIPTOR_HEADER.size:
+        ].decode("ascii")
+    except UnicodeDecodeError as exc:
+        raise Corruption("malformed retirable subject") from exc
+    if not _NAME_RE.fullmatch(subject):
+        raise Corruption("malformed retirable subject")
+    return subject, body_offset, body_length
+
+
+class RetirableJournal:
+    """Audit journal whose descriptors stay replayable after source erasure.
+
+    The cursor/consumer implementation is the ordinary
+    :class:`RetainedJournal` under ``directory/events``.  Descriptor frames
+    contain source and body-location metadata only; raw bodies live in
+    source-specific pack files in the surrounding directory.
+    """
+
+    def __init__(self, directory, *, hook=None):
+        if hook is not None and not callable(hook):
+            raise ValueError("hook must be callable")
+        self._dir = os.fspath(directory)
+        self._hook = hook
+        self._closed = False
+        os.makedirs(self._dir, exist_ok=True)
+
+        # The events lock is also the single-active-handle lock for the whole
+        # RetirableJournal directory.
+        self._events = RetainedJournal(
+            os.path.join(self._dir, "events")
+        )
+        try:
+            self._state_path = os.path.join(self._dir, _RETIRE_STATE_NAME)
+            self._subjects = {}
+            self._heads = {}
+            self._keep_from = {}
+            self._subject_live = {}
+            self._frame_count = 0
+            self._live_bytes = 0
+            self._load_state()
+            self._finish_retirements()
+            self._scan_descriptors()
+            # Complete an interrupted descriptor-prefix/body compaction before
+            # the handle becomes usable.  In a quiescent directory this is a
+            # no-op.
+            self._compact_body_packs()
+            self._reconcile_body_files()
+        except BaseException:
+            self._events.close()
+            raise
+
+    # -- paths and small helpers -------------------------------------------
+
+    def _body_path(self, subject):
+        return os.path.join(
+            self._dir, _RETIRE_BODY_TEMPLATE.format(subject)
+        )
+
+    def _body_name(self, subject):
+        return _RETIRE_BODY_TEMPLATE.format(subject)
+
+    def _fsync_dir(self):
+        dir_fd = os.open(self._dir, os.O_RDONLY)
+        try:
+            os.fsync(dir_fd)
+        finally:
+            os.close(dir_fd)
+
+    def _require_open(self):
+        if self._closed:
+            raise RuntimeError("RetirableJournal is closed")
+
+    @staticmethod
+    def _validate_subject(subject):
+        if not isinstance(subject, str) or not _NAME_RE.fullmatch(subject):
+            raise ValueError(
+                "subject must be 1-32 case-sensitive ASCII letters, digits, "
+                "'_' or '-'"
+            )
+
+    def _invoke_hook(self, phase):
+        if self._hook is not None:
+            self._hook(phase)
+
+    # -- state persistence --------------------------------------------------
+
+    def _load_state(self):
+        # Atomic state publication uses replace(); an leftover tmp is never the
+        # committed state and can safely be removed under the active flock.
+        try:
+            os.unlink(self._state_path + ".tmp")
+        except FileNotFoundError:
+            pass
+        try:
+            with open(self._state_path, "rb") as handle:
+                raw = handle.read()
+        except FileNotFoundError:
+            self._subjects = {}
+            self._save_state()
+            return
+
+        try:
+            state = json.loads(raw.decode("utf-8"))
+            if (
+                not isinstance(state, dict)
+                or state.get("version") != _RETIRE_STATE_VERSION
+                or not isinstance(state.get("subjects"), dict)
+            ):
+                raise Corruption("malformed retirable.json")
+            subjects = state["subjects"]
+            loaded = {}
+            for subject, info in subjects.items():
+                self._validate_subject(subject)
+                if not isinstance(info, dict):
+                    raise Corruption("malformed retirable subject state")
+                retired = info.get("retired", False)
+                base = info.get("base", 0)
+                if type(retired) is not bool:
+                    raise Corruption("malformed retired flag")
+                if type(base) is not int or base < 0:
+                    raise Corruption("malformed body pack base")
+                loaded[subject] = {"retired": retired, "base": base}
+        except (ValueError, UnicodeDecodeError, KeyError, TypeError) as exc:
+            raise Corruption("invalid retirable.json") from exc
+        self._subjects = loaded
+
+    def _save_state(self):
+        subjects = {
+            subject: {
+                "retired": bool(info["retired"]),
+                "base": int(info["base"]),
+            }
+            for subject, info in self._subjects.items()
+        }
+        payload = json.dumps(
+            {"version": _RETIRE_STATE_VERSION, "subjects": subjects},
+            sort_keys=True,
+        ).encode("utf-8")
+        tmp_path = self._state_path + ".tmp"
+        with open(tmp_path, "wb") as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp_path, self._state_path)
+        self._fsync_dir()
+
+    # -- startup scan and recovery -----------------------------------------
+
+    def _remove_subject_files(self, subject):
+        """Remove every body pack/staging file for exactly this subject."""
+        exact_name = self._body_name(subject)
+        staging_prefix = exact_name + "."
+        removed = False
+        for name in os.listdir(self._dir):
+            if name != exact_name and not name.startswith(staging_prefix):
+                continue
+            path = os.path.join(self._dir, name)
+            if os.path.islink(path) or os.path.isfile(path):
+                os.unlink(path)
+                removed = True
+            elif os.path.isdir(path):
+                raise Corruption(f"unexpected body directory entry: {name}")
+        return removed
+
+    def _finish_retirements(self):
+        removed_any = False
+        for subject, info in self._subjects.items():
+            if info["retired"] and self._remove_subject_files(subject):
+                removed_any = True
+        if removed_any:
+            self._fsync_dir()
+
+    def _scan_descriptors(self):
+        self._frame_count = 0
+        self._live_bytes = 0
+        self._heads = {}
+        self._keep_from = {}
+        self._subject_live = {}
+
+        offset = self._events.floor
+        end = self._events.end
+        while offset < end:
+            rows = self._events.read(offset, limit=_RETIRE_SCAN_BATCH)
+            if not rows:
+                raise Corruption("descriptor scan ended before journal end")
+            for row in rows:
+                subject, body_offset, body_length = (
+                    _decode_retirable_descriptor(row.data)
+                )
+                self._frame_count += 1
+                body_end = body_offset + body_length
+                self._heads[subject] = max(
+                    self._heads.get(subject, 0), body_end
+                )
+                self._keep_from[subject] = min(
+                    self._keep_from.get(subject, body_offset), body_offset
+                )
+
+                info = self._subjects.get(subject)
+                if info is None:
+                    # Tolerate an interrupted append/state ordering without
+                    # losing a successfully written descriptor frame.
+                    info = {"retired": False, "base": 0}
+                    self._subjects[subject] = info
+                if not info["retired"]:
+                    self._live_bytes += body_length
+                    self._subject_live[subject] = (
+                        self._subject_live.get(subject, 0) + body_length
+                    )
+            next_offset = rows[-1].next_offset
+            if next_offset <= offset:
+                raise Corruption("descriptor scan made no progress")
+            offset = next_offset
+        if offset != end:
+            raise Corruption("descriptor scan did not reach journal end")
+
+    def _reconcile_body_files(self):
+        state_dirty = False
+        for subject, info in self._subjects.items():
+            if info["retired"]:
+                continue
+            path = self._body_path(subject)
+            staging_path = path + ".tmp"
+            try:
+                os.unlink(staging_path)
+                self._fsync_dir()
+            except FileNotFoundError:
+                pass
+            head = self._heads.get(subject)
+            if head is None:
+                # No retained descriptor references this pack.
+                if self._remove_subject_files(subject):
+                    self._fsync_dir()
+                if info["base"] != 0:
+                    info["base"] = 0
+                    state_dirty = True
+                continue
+
+            base = info["base"]
+            expected_size = head - base
+            if expected_size < 0:
+                raise Corruption(f"body pack base is beyond {subject} head")
+            try:
+                if os.path.islink(path):
+                    raise Corruption(f"body pack is a symlink: {subject}")
+                actual_size = os.stat(path).st_size
+            except FileNotFoundError:
+                if expected_size:
+                    raise Corruption(f"missing body pack for {subject}")
+                continue
+            if actual_size < expected_size:
+                raise Corruption(f"short body pack for {subject}")
+            if actual_size > expected_size:
+                with open(path, "r+b") as handle:
+                    handle.truncate(expected_size)
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                self._fsync_dir()
+        if state_dirty:
+            self._save_state()
+
+    # -- boundaries ---------------------------------------------------------
+
+    @property
+    def floor(self):
+        self._require_open()
+        return self._events.floor
+
+    @property
+    def end(self):
+        self._require_open()
+        return self._events.end
+
+    # -- appending and reading ---------------------------------------------
+
+    def append(self, subject, data):
+        """Append one descriptor plus its raw body; return the frame cursor."""
+        self._require_open()
+        self._validate_subject(subject)
+        if not isinstance(data, bytes) or len(data) > _RETIRE_MAX_DATA:
+            raise ValueError(
+                f"data must be bytes of at most {_RETIRE_MAX_DATA} bytes"
+            )
+
+        info = self._subjects.get(subject)
+        if info is not None and info["retired"]:
+            raise ValueError(f"subject {subject!r} has been retired")
+        if info is None and len(self._subjects) >= _RETIRE_MAX_SUBJECTS:
+            raise ValueError(
+                f"at most {_RETIRE_MAX_SUBJECTS} subjects are admitted"
+            )
+        if self._frame_count >= _RETIRE_MAX_DESCRIPTORS:
+            raise ValueError(
+                f"at most {_RETIRE_MAX_DESCRIPTORS} descriptor frames can be "
+                "retained"
+            )
+        if self._live_bytes + len(data) > _RETIRE_MAX_LIVE_BYTES:
+            raise ValueError(
+                "unretired readable bodies would exceed 64 MiB"
+            )
+
+        body_offset = self._heads.get(subject, 0)
+        if data:
+            path = self._body_path(subject)
+            # Opening in append mode writes at the current physical end.  After
+            # compaction physical size is head - base, so this remains the
+            # correct append point.
+            with open(path, "ab") as handle:
+                view = memoryview(data)
+                written = 0
+                while written < len(view):
+                    count = handle.write(view[written:])
+                    if not count:
+                        raise OSError("short write to body pack")
+                    written += count
+                handle.flush()
+                os.fsync(handle.fileno())
+
+        descriptor = _encode_retirable_descriptor(
+            subject, body_offset, len(data)
+        )
+        offset = self._events.append(descriptor)
+
+        self._frame_count += 1
+        body_end = body_offset + len(data)
+        self._heads[subject] = max(self._heads.get(subject, 0), body_end)
+        if info is None:
+            info = {"retired": False, "base": 0}
+            self._subjects[subject] = info
+            self._save_state()
+        self._live_bytes += len(data)
+        self._subject_live[subject] = (
+            self._subject_live.get(subject, 0) + len(data)
+        )
+        return offset
+
+    def read(self, offset=None, *, limit=16):
+        """Read up to 16 consecutive events without advancing consumers."""
+        self._require_open()
+        if offset is None:
+            offset = self._events.floor
+        if (
+            type(offset) is not int
+            or type(limit) is not int
+            or not 1 <= limit <= _RETIRE_READ_LIMIT_MAX
+        ):
+            raise ValueError(
+                "offset must be a true integer and limit must be a true "
+                "integer from 1 through 16"
+            )
+
+        rows = self._events.read(offset, limit=limit)
+        records = []
+        handles = {}
+        try:
+            for row in rows:
+                subject, body_offset, body_length = (
+                    _decode_retirable_descriptor(row.data)
+                )
+                info = self._subjects[subject]
+                if info["retired"]:
+                    data = None
+                elif body_length == 0:
+                    data = b""
+                else:
+                    handle = handles.get(subject)
+                    if handle is None:
+                        handle = open(self._body_path(subject), "rb")
+                        handles[subject] = handle
+                    physical_offset = body_offset - info["base"]
+                    handle.seek(physical_offset)
+                    data = handle.read(body_length)
+                    if len(data) != body_length:
+                        raise Corruption(
+                            f"short body read at journal offset {row.offset}"
+                        )
+                records.append(
+                    RetirableRecord(
+                        row.offset, row.next_offset, subject, data
+                    )
+                )
+        finally:
+            for handle in handles.values():
+                handle.close()
+        return records
+
+    # -- retirement ---------------------------------------------------------
+
+    def retire(self, subject):
+        """Durably retire a source; return True only on its first retirement."""
+        self._require_open()
+        self._validate_subject(subject)
+        info = self._subjects.get(subject)
+        if info is not None and info["retired"]:
+            return False
+        if info is None and len(self._subjects) >= _RETIRE_MAX_SUBJECTS:
+            raise ValueError(
+                f"at most {_RETIRE_MAX_SUBJECTS} subjects are admitted"
+            )
+
+        has_bodies = self._subject_live.get(subject, 0) > 0
+        if has_bodies:
+            # No retirement marker or unlink has happened yet: a kill here
+            # reopens as the fully writable original source.
+            self._invoke_hook("before_erase")
+
+        if info is None:
+            info = {"retired": True, "base": 0}
+            self._subjects[subject] = info
+        else:
+            info["retired"] = True
+
+        released = self._subject_live.pop(subject, 0)
+        self._live_bytes -= released
+        # Retirement is now committed.  Reopening after any later exit must
+        # finish erasure even if this call did not return.
+        self._save_state()
+
+        removed = self._remove_subject_files(subject)
+        if removed:
+            self._fsync_dir()
+        if has_bodies:
+            # All known copies have been unlinked.  A kill in the hook leaves
+            # the committed retired marker for startup reconciliation.
+            self._invoke_hook("after_first_removal")
+        return True
+
+    # -- consumer cursors and prefix pruning -------------------------------
+
+    def register(self, name):
+        self._require_open()
+        return self._events.register(name)
+
+    def checkpoint(self, name):
+        self._require_open()
+        return self._events.checkpoint(name)
+
+    def ack(self, name, next_offset):
+        self._require_open()
+        self._events.ack(name, next_offset)
+
+    def drop(self, name):
+        self._require_open()
+        return self._events.drop(name)
+
+    def _copy_body_suffix(self, source_path, staging_path, skip_bytes):
+        source_size = os.stat(source_path).st_size
+        if skip_bytes > source_size:
+            raise Corruption("body compaction starts beyond pack end")
+        with open(source_path, "rb") as source, open(
+            staging_path, "wb"
+        ) as staging:
+            source.seek(skip_bytes)
+            while True:
+                chunk = source.read(_RETIRE_COPY_CHUNK)
+                if not chunk:
+                    break
+                staging.write(chunk)
+            staging.flush()
+            os.fsync(staging.fileno())
+
+    def _compact_body_packs(self):
+        state_dirty = False
+        for subject, info in self._subjects.items():
+            if info["retired"]:
+                continue
+            keep_from = self._keep_from.get(subject)
+            old_base = info["base"]
+            path = self._body_path(subject)
+
+            if keep_from is None:
+                self._remove_subject_files(subject)
+                self._heads.pop(subject, None)
+                if old_base != 0:
+                    info["base"] = 0
+                    state_dirty = True
+                continue
+
+            skip_bytes = keep_from - old_base
+            if skip_bytes < 0:
+                raise Corruption(
+                    f"body compaction moved backwards for {subject}"
+                )
+            if skip_bytes == 0:
+                continue
+
+            staging_path = path + ".tmp"
+            self._copy_body_suffix(path, staging_path, skip_bytes)
+            os.replace(staging_path, path)
+            self._fsync_dir()
+            info["base"] = keep_from
+            state_dirty = True
+
+        if state_dirty:
+            self._save_state()
+
+    def prune(self):
+        """Prune the consumer-safe descriptor prefix and its body bytes."""
+        self._require_open()
+        old_floor = self._events.floor
+        new_floor = self._events.prune()
+        if new_floor == old_floor:
+            # Quiescent packs already correspond to old_floor; there is no new
+            # prefix body data to remove.
+            return new_floor
+        # Rebuild only from surviving descriptors, then compact source packs to
+        # the first surviving body offset for each source.
+        self._scan_descriptors()
+        self._compact_body_packs()
+        return new_floor
+
+    # -- lifecycle ----------------------------------------------------------
+
+    def close(self):
+        if self._closed:
+            return
+        self._closed = True
+        self._events.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_exc):
+        self.close()

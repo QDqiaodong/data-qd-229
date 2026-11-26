@@ -272,3 +272,55 @@ tests：`test_checkpoint_journal.py` 覆盖切点前后状态、空值与删除�
 不能让写入成功、发布并回收后新帧落在旧 `end`、超容量拒绝、删除后从旧基线
 重新发布、并把 >48 MiB 基线缩到两个值，按 `/proc/self/io` 的 `wchar` 差值
 验收该次发布的写入量。
+
+# 可撤除指定来源正文的 RetirableJournal
+
+`RetirableJournal(directory, *, hook=None)` 在专用目录中把多来源诊断事件写入
+`directory/events` 下的普通 `RetainedJournal`，支持上下文管理。描述帧只保存
+来源、正文包内偏移和长度；原始正文按来源连续打包在
+`body-<subject>.bin`，不压缩、不加密，也不写出目录。
+
+```python
+from journal import RetirableJournal, ExpiredOffset
+
+with RetirableJournal("./run/audit") as audit:
+    first = audit.append("gateway-a", b"diagnostic body")
+    empty = audit.append("gateway-b", b"")
+    audit.register("oncall")
+
+    audit.retire("gateway-a")       # 首次 True，重试 False
+    rows = audit.read(limit=16)
+    # gateway-a 事件仍在原游标，data is None；gateway-b 的 b"" 不变。
+
+    audit.ack("oncall", audit.end)
+    audit.prune()                   # 才真正推进底层 floor 并删除前缀正文
+```
+
+- 容量：目录生命周期内至多接纳 32 个来源（首次成功 `append` 或 `retire`
+  都算接纳，包括从未写入但被撤除的来源）；当前保留至多 8,192 个描述帧；
+  未撤除且仍在描述日志中的非空正文合计至多 64 MiB；单条 `data` 至多
+  1,000,000 字节。拒绝参数或超限时不写描述帧、正文或来源状态。
+- 读取：`read(offset=None, *, limit=16)` 的游标、`next_offset`、
+  `ExpiredOffset`、帧内/越界/布尔参数规则与底层日志一致。每条记录有
+  `offset`、`next_offset`、`subject`、`data`；已撤除来源的 `data` 为
+  `None`，未撤除的空正文仍为 `b""`。读取不推进确认。
+- 撤除：`retire(subject) -> bool` 首次撤除返回 `True`。撤除立即从配额移除
+  该来源正文并持久化 retired 状态，随后 `unlink` 该来源自己的正文包和
+  暂存文件；不推进 `floor`、`end` 或消费者确认，也不影响其他来源（包括
+  内容恰好相同的来源）。已撤除来源永远不能再 `append`，即使旧描述帧已被
+  前缀回收。
+- 回调：仅有当前非空正文要移除时调用 `hook("before_erase")` 和
+  `hook("after_first_removal")` 各一次。前一点退出时尚未写撤除状态，重开
+  保留全部正文和追加资格；后一点退出时 retired 状态已提交且正文包已
+  unlink，重开先完成清理/撤除状态恢复，再提供读写。
+- 回收：`register`、`checkpoint`、`ack`、`drop` 与 `prune` 直接沿用底层
+  `RetainedJournal` 的消费者语义和 16 个消费者上限。`prune()` 得到新的
+  真实 `floor` 后，会压缩各幸存来源的正文包以删除前缀正文；描述帧游标不
+  变。关闭后可直接用 `RetainedJournal(directory / "events")` 核对切点和
+  确认位置。
+
+`test_retirable_journal.py` 覆盖题述 A/B/空正文交替、两个撤除退出点、
+原游标和确认保持、前缀回收、原始字节擦除、同内容异来源保留、参数/来源上限，
+以及 Linux 48 MiB `RLIMIT_AS` 子进程中 67 条百万字节正文、536 个小事件、
+容量拒绝、`after_first_removal` 杀死续恢复、`/proc/self/io` 写入量、
+目录长度和 256 文件数限制。
