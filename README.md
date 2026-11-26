@@ -76,7 +76,47 @@ directory/
 每段的逻辑起点持久化在清单里，重写切点所在段时只复制幸存后缀，回收期间额外
 占用不超过一个段（约 256 KiB）量级的空间。
 
+# 乱序接收与无缺口回放
+
+`ReplicaJournal(directory, *, source_id, max_pending_bytes)` 在独立接收目录中
+保存中继送达的现有 `Record`，支持上下文管理；只使用标准库。`source_id` 必须是
+1–64 个 ASCII 字母、数字、`_` 或 `-`，`max_pending_bytes` 是 0–64 MiB（含）的
+整数。首次打开会写入 `replica.json`，以后重开必须提供完全相同的两个参数，否则
+抛 `ValueError` 且不会重置目录。
+
+```python
+from journal import Journal, ReplicaJournal
+
+with Journal("./run/source.aj") as source:
+    records = source.read(cursor, limit=8)
+
+with ReplicaJournal(
+    "./run/replica",
+    source_id="source-42",
+    max_pending_bytes=2 * 1024 * 1024,
+) as replica:
+    new_end = replica.ingest(records)  # 非空 list/tuple，最多 256 条/4 MiB
+    print(replica.end, replica.pending_bytes)
+
+    # 只返回从 offset=4 开始、已经连续的前缀；到达 end 时返回 []。
+    rows = replica.read(cursor, limit=4)
+    if rows:
+        cursor = rows[-1].next_offset
+```
+
+- `end` 初值为 `4`，是从 4 起的最长连续已接收前缀末端。远处的帧会持久保存并
+  计入 `pending_bytes`，但不能通过 `read` 绕过缺口；补齐缺口后，已暂存的后段
+  立即可按原游标读取，无需重传。
+- 只有同起点、同末端且负载逐字节相同的帧算重复；其他区间重叠抛
+  `ReplicaConflict`（`ValueError` 子类）。去重、接通连续前缀后仍在缺口之后的
+  帧才按 `12 + len(data)` 计预算；超预算抛 `ReplicaBackpressure`（也是
+  `ValueError` 子类）。冲突检查先于预算检查，两种拒绝都不会留下本批新帧。
+- 每帧使用单独的 `frame-<offset>.aj` 文件保存 AJ1 编码，不用大文件偏移空洞
+  表示未收到的区间，因此真实块占用不会为四十多 MiB 缺口写入实心填充。
+
 测试：`test_journal.py` 覆盖原单文件日志；`test_retained_journal.py` 覆盖
 续读/确认语义、回收与回收到 `end`、两类重开结果、空间预算，以及在两个回调
-点用真实子进程 `SIGKILL` 终止后重开的切点、确认位置、后缀与清理结果。
+点用真实子进程 `SIGKILL` 终止后重开的切点、确认位置、后缀与清理结果；
+`test_replica_journal.py` 覆盖 A–H 乱序/重复/冲突/预算/重开场景，并在 Linux
+子进程的 40 MiB `RLIMIT_AS` 中验证 48 个近 1 MiB 帧、块占用和分批回放。
 

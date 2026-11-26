@@ -148,6 +148,446 @@ class ExpiredOffset(ValueError):
     """Raised when a read offset is below the retained journal's floor."""
 
 
+class ReplicaConflict(ValueError):
+    """An incoming frame overlaps a stored frame with different content."""
+
+
+class ReplicaBackpressure(ValueError):
+    """Accepting a batch would exceed the replica's pending-byte budget."""
+
+
+# --- ReplicaJournal out-of-order receiver ----------------------------------
+# Directory layout (implementation details):
+#   replica.json                 source identity and pending byte budget
+#   frame-<offset:012d>.aj       one complete AJ1-encoded frame per file
+#
+# Sparse logical offsets are represented by file names, never by seeking a
+# shared file to a large offset and leaving a solid hole.  Only small metadata
+# stays in memory; payloads are read back from their individual frame files.
+
+_REPLICA_CONFIG_NAME = "replica.json"
+_REPLICA_FRAME_RE = re.compile(r"frame-(\d+)\.aj\Z")
+_REPLICA_SOURCE_RE = re.compile(r"[A-Za-z0-9_-]{1,64}\Z")
+_REPLICA_START = len(MAGIC)
+_REPLICA_MAX_SOURCE_BYTES = 64 * 1024 * 1024
+_REPLICA_MAX_FRAMES = 65536
+_REPLICA_MAX_PENDING_BYTES = 64 * 1024 * 1024
+_REPLICA_MAX_BATCH_RECORDS = 256
+_REPLICA_MAX_BATCH_BYTES = 4 * 1024 * 1024
+_REPLICA_MAX_READ_LIMIT = 8
+_REPLICA_CONFIG_VERSION = 1
+
+
+class ReplicaJournal:
+    """Local receiver for out-of-order, duplicated, and batched source frames.
+
+    Accepted frames are stored individually under ``directory``.  ``end`` is
+    always the end of the longest contiguous prefix beginning at offset 4;
+    frames after a hole are durable and count against ``max_pending_bytes`` but
+    are not readable until the hole is filled.
+    """
+
+    def __init__(self, directory, *, source_id, max_pending_bytes):
+        if not isinstance(source_id, str) or not _REPLICA_SOURCE_RE.fullmatch(
+            source_id
+        ):
+            raise ValueError(
+                "source_id must be 1-64 ASCII letters, digits, '_' or '-'"
+            )
+        if (
+            type(max_pending_bytes) is not int
+            or not 0 <= max_pending_bytes <= _REPLICA_MAX_PENDING_BYTES
+        ):
+            raise ValueError(
+                "max_pending_bytes must be an integer from 0 through 64 MiB"
+            )
+
+        self._directory = os.fspath(directory)
+        self._source_id = source_id
+        self._max_pending_bytes = max_pending_bytes
+        self._config_path = os.path.join(self._directory, _REPLICA_CONFIG_NAME)
+        self._closed = False
+        self._next_by_offset = {}
+        self._offsets = []
+
+        os.makedirs(self._directory, exist_ok=True)
+        self._open_config()
+        self._load_frames()
+        self._end = self._contiguous_end(self._next_by_offset, _REPLICA_START)
+        self._pending_bytes = self._count_pending(
+            self._next_by_offset, self._end
+        )
+
+    # -- setup / persistence ------------------------------------------------
+
+    def _fsync_directory(self):
+        dir_fd = os.open(self._directory, os.O_RDONLY)
+        try:
+            os.fsync(dir_fd)
+        finally:
+            os.close(dir_fd)
+
+    def _write_config(self):
+        payload = json.dumps(
+            {
+                "version": _REPLICA_CONFIG_VERSION,
+                "source_id": self._source_id,
+                "max_pending_bytes": self._max_pending_bytes,
+            },
+            sort_keys=True,
+        ).encode("utf-8")
+        tmp_path = self._config_path + ".tmp"
+        with open(tmp_path, "wb") as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp_path, self._config_path)
+        self._fsync_directory()
+
+    def _open_config(self):
+        try:
+            with open(self._config_path, "rb") as handle:
+                raw = handle.read()
+        except FileNotFoundError:
+            self._write_config()
+            return
+
+        try:
+            config = json.loads(raw.decode("utf-8"))
+            stored_source = config["source_id"]
+            stored_budget = config["max_pending_bytes"]
+            version = config["version"]
+        except (ValueError, UnicodeDecodeError, KeyError, TypeError) as exc:
+            raise Corruption("invalid replica.json") from exc
+        if version != _REPLICA_CONFIG_VERSION:
+            raise Corruption("unsupported replica.json version")
+        if (
+            not isinstance(stored_source, str)
+            or type(stored_budget) is not int
+        ):
+            raise Corruption("malformed replica.json")
+
+        # A configuration mismatch must never rewrite or reset the directory.
+        if stored_source != self._source_id:
+            raise ValueError(
+                f"directory belongs to source_id {stored_source!r}, "
+                f"not {self._source_id!r}"
+            )
+        if stored_budget != self._max_pending_bytes:
+            raise ValueError(
+                "max_pending_bytes does not match the value used when the "
+                "replica directory was created"
+            )
+
+    def _frame_path(self, offset):
+        return os.path.join(self._directory, f"frame-{offset:012d}.aj")
+
+    def _load_frames(self):
+        for name in os.listdir(self._directory):
+            match = _REPLICA_FRAME_RE.fullmatch(name)
+            if match is None:
+                continue
+            offset = int(match.group(1))
+            path = os.path.join(self._directory, name)
+            if os.path.islink(path) or not os.path.isfile(path):
+                raise Corruption(f"unexpected replica frame entry: {name}")
+            encoded_length = os.stat(path).st_size
+            if (
+                offset < _REPLICA_START
+                or encoded_length < _HEADER.size
+                or offset + encoded_length
+                > _REPLICA_START + _REPLICA_MAX_SOURCE_BYTES
+            ):
+                raise Corruption(f"replica frame {name} is out of range")
+            if offset in self._next_by_offset:
+                raise Corruption(f"duplicate replica frame entry for {offset}")
+
+            # Validate only the fixed header during open.  Payload checksums are
+            # checked when a frame is read; this keeps reopening linear and
+            # avoids retaining payload memory.
+            with open(path, "rb") as handle:
+                header = handle.read(_HEADER.size)
+            if len(header) != _HEADER.size:
+                raise Corruption(f"short replica frame header in {name}")
+            length, _body_crc = _decode_header(header, offset)
+            if _HEADER.size + length != encoded_length:
+                raise Corruption(f"replica frame length mismatch in {name}")
+
+            self._next_by_offset[offset] = offset + encoded_length
+
+        self._offsets = sorted(self._next_by_offset)
+
+    @staticmethod
+    def _contiguous_end(next_by_offset, start):
+        end = start
+        while True:
+            next_offset = next_by_offset.get(end)
+            if next_offset is None:
+                return end
+            end = next_offset
+
+    @staticmethod
+    def _count_pending(next_by_offset, end):
+        total = 0
+        for offset, next_offset in next_by_offset.items():
+            # Accepted intervals never overlap.  Every frame below the maximal
+            # prefix end is part of that prefix; all remaining frames wait on
+            # one or more holes.
+            if offset >= end:
+                total += next_offset - offset
+        return total
+
+    # -- state --------------------------------------------------------------
+
+    @property
+    def end(self):
+        return self._end
+
+    @property
+    def pending_bytes(self):
+        return self._pending_bytes
+
+    @property
+    def source_id(self):
+        return self._source_id
+
+    @property
+    def max_pending_bytes(self):
+        return self._max_pending_bytes
+
+    def _require_open(self):
+        if self._closed:
+            raise RuntimeError("ReplicaJournal is closed")
+
+    def close(self):
+        self._closed = True
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_exc):
+        self.close()
+
+    # -- ingestion ----------------------------------------------------------
+
+    @staticmethod
+    def _validate_batch(records):
+        if not isinstance(records, (list, tuple)):
+            raise ValueError("records must be a non-empty list or tuple")
+        if not records or len(records) > _REPLICA_MAX_BATCH_RECORDS:
+            raise ValueError(
+                "a batch must contain 1 through 256 Record objects"
+            )
+
+        batch_bytes = 0
+        expected_offset = None
+        for index, record in enumerate(records):
+            if not isinstance(record, Record):
+                raise ValueError("every batch item must be a Record")
+            if type(record.offset) is not int:
+                raise ValueError("Record.offset must be a true integer")
+            if type(record.next_offset) is not int:
+                raise ValueError("Record.next_offset must be a true integer")
+            if not isinstance(record.data, bytes):
+                raise ValueError("Record.data must be bytes")
+            if len(record.data) > MAX_RECORD:
+                raise ValueError(
+                    f"record payload exceeds {MAX_RECORD} bytes"
+                )
+
+            encoded_length = _HEADER.size + len(record.data)
+            if record.next_offset != record.offset + encoded_length:
+                raise ValueError(
+                    "Record.next_offset must equal offset + 12 + len(data)"
+                )
+            if (
+                record.offset < _REPLICA_START
+                or record.next_offset
+                > _REPLICA_START + _REPLICA_MAX_SOURCE_BYTES
+            ):
+                raise ValueError(
+                    "record lies outside the source's first 64 MiB of "
+                    "encoded frames"
+                )
+            if index and record.offset != expected_offset:
+                raise ValueError("frames in a batch must be contiguous")
+
+            expected_offset = record.next_offset
+            batch_bytes += encoded_length
+
+        if batch_bytes > _REPLICA_MAX_BATCH_BYTES:
+            raise ValueError("encoded batch total exceeds 4 MiB")
+
+    def _payload_matches(self, offset, data):
+        with open(self._frame_path(offset), "rb") as handle:
+            header = handle.read(_HEADER.size)
+            if len(header) != _HEADER.size:
+                raise Corruption(f"short replica frame header at {offset}")
+            # The endpoints already establish the payload length; compare the
+            # bytes directly so a CRC collision cannot turn a conflict into a
+            # duplicate.
+            return handle.read() == data
+
+    def _check_overlap(self, record):
+        """Return True for an exact duplicate, otherwise raise conflict."""
+        offset = record.offset
+        end = record.next_offset
+        index = bisect_right(self._offsets, offset) - 1
+
+        if index >= 0:
+            old_offset = self._offsets[index]
+            old_end = self._next_by_offset[old_offset]
+            if offset < old_end:  # old_offset <= offset < old_end
+                if (
+                    old_offset == offset
+                    and old_end == end
+                    and self._payload_matches(old_offset, record.data)
+                ):
+                    return True
+                raise ReplicaConflict(
+                    f"incoming frame at {offset} conflicts with stored frame "
+                    f"at {old_offset}"
+                )
+
+        # index + 1 is the first stored start strictly after the rightmost
+        # start <= offset.  Every such start below end overlaps this record.
+        j = index + 1
+        while j < len(self._offsets) and self._offsets[j] < end:
+            old_offset = self._offsets[j]
+            raise ReplicaConflict(
+                f"incoming frame at {offset} conflicts with stored frame at "
+                f"{old_offset}"
+            )
+        return False
+
+    def ingest(self, records):
+        self._require_open()
+        self._validate_batch(records)
+
+        # Conflict detection has priority over the pending-byte budget and must
+        # be all-or-nothing, so do it before creating any frame file.
+        new_records = []
+        for record in records:
+            if not self._check_overlap(record):
+                new_records.append(record)
+
+        if (
+            len(self._next_by_offset) + len(new_records)
+            > _REPLICA_MAX_FRAMES
+        ):
+            raise ValueError("replica cannot hold more than 65,536 frames")
+
+        # Compute the prospective prefix without copying the whole index.
+        # New frames below the current prefix can only be exact duplicates and
+        # were filtered out above, so chain extension starts at self._end.
+        new_next_by_offset = {
+            record.offset: record.next_offset for record in new_records
+        }
+        new_bytes = sum(
+            next_offset - offset
+            for offset, next_offset in new_next_by_offset.items()
+        )
+        new_end = self._end
+        connected_bytes = 0
+        while True:
+            if new_end in new_next_by_offset:
+                next_offset = new_next_by_offset[new_end]
+            else:
+                next_offset = self._next_by_offset.get(new_end)
+                if next_offset is None:
+                    break
+            connected_bytes += next_offset - new_end
+            new_end = next_offset
+
+        # Old pending bytes + all genuinely new bytes - every frame in the
+        # newly connected chain (some old pending, some newly supplied).
+        new_pending_bytes = (
+            self._pending_bytes + new_bytes - connected_bytes
+        )
+
+        if new_pending_bytes > self._max_pending_bytes:
+            raise ReplicaBackpressure(
+                f"pending frames need {new_pending_bytes} bytes; budget is "
+                f"{self._max_pending_bytes}"
+            )
+
+        # All rejection checks are complete.  Persist each new frame as its
+        # own allocated file.  The file context flushes its buffers before
+        # ingest returns; crash durability is outside this receiver's scope.
+        for record in new_records:
+            path = self._frame_path(record.offset)
+            fields = _FIELDS.pack(
+                len(record.data), crc32(record.data)
+            )
+            header = fields + crc32(fields).to_bytes(4, "big")
+            with open(path, "xb") as handle:
+                handle.write(header)
+                handle.write(record.data)
+
+        if new_records:
+            for record in new_records:
+                self._next_by_offset[record.offset] = record.next_offset
+                self._offsets.append(record.offset)
+            self._offsets.sort()
+
+        self._end = new_end
+        self._pending_bytes = new_pending_bytes
+        return self._end
+
+    # -- replay -------------------------------------------------------------
+
+    def read(self, offset=_REPLICA_START, *, limit=4):
+        self._require_open()
+        if type(offset) is not int:
+            raise ValueError("offset must be an integer")
+        if type(limit) is not int or not 1 <= limit <= _REPLICA_MAX_READ_LIMIT:
+            raise ValueError("limit must be an integer from 1 through 8")
+        if offset < _REPLICA_START or offset > self._end:
+            raise ValueError(
+                "offset must be at least 4 and no greater than the contiguous "
+                "replica end"
+            )
+        if offset == self._end:
+            return []
+
+        index = bisect_left(self._offsets, offset)
+        if index >= len(self._offsets) or self._offsets[index] != offset:
+            raise ValueError("offset is not a received frame boundary")
+
+        rows = []
+        current = offset
+        while len(rows) < limit and current < self._end:
+            if (
+                index >= len(self._offsets)
+                or self._offsets[index] != current
+            ):
+                raise Corruption("replica prefix does not follow frame boundaries")
+            next_offset = self._next_by_offset[current]
+            path = self._frame_path(current)
+            with open(path, "rb") as handle:
+                header = handle.read(_HEADER.size)
+                if len(header) != _HEADER.size:
+                    raise Corruption(f"short replica frame header at {current}")
+                length, expected_crc = _decode_header(header, current)
+                if current + _HEADER.size + length != next_offset:
+                    raise Corruption(
+                        f"replica frame metadata mismatch at {current}"
+                    )
+                data = handle.read(length)
+                if len(data) < length:
+                    raise Corruption(f"short replica frame payload at {current}")
+                if crc32(data) != expected_crc:
+                    raise Corruption(
+                        f"payload checksum mismatch at byte {current}"
+                    )
+
+            rows.append(Record(current, next_offset, data))
+            current = next_offset
+            index += 1
+
+        return rows
+
+
 # --- RetainedJournal on-disk layout ---------------------------------------
 # directory/
 #   lock                       single active handle (flock; zero bytes)
