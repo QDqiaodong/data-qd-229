@@ -845,6 +845,12 @@ class RetainedJournal:
     def _segment_name(self, index):
         return self._segments[index][0]
 
+    def _is_boundary(self, offset):
+        if offset == self._end:
+            return True
+        index = bisect_left(self._offsets, offset)
+        return index < len(self._offsets) and self._offsets[index] == offset
+
     # -- append ------------------------------------------------------------
 
     def append(self, data):
@@ -1032,6 +1038,16 @@ class RetainedJournal:
             new_floor = min(self._consumers.values())
         else:
             new_floor = self._floor
+        return self._prune_to(new_floor)
+
+    def _prune_to(self, new_floor):
+        """Physically release the prefix below ``new_floor``.
+
+        ``new_floor`` must be a frame boundary at or below ``end`` and must not
+        precede the current floor.  Exposed internally so cursor-tracking
+        journals can prune to a computed cut point without inventing a consumer.
+        """
+        self._require_open()
         if new_floor <= self._floor:
             return self._floor
         if new_floor > self._end or (
@@ -1599,6 +1615,646 @@ class LeasedWorkJournal:
             return
         self._closed = True
         self._journal.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_exc):
+        self.close()
+
+
+# --- CheckpointJournal: full-state baseline plus retained deltas -----------
+# Directory layout (implementation details):
+#   directory/
+#     events/                    RetainedJournal: one AJ1 frame per change
+#     checkpoint.json            committed baseline generation and cut
+#     state-NNNNNNNNNNNN.ckpt    complete key/value state at that cut
+#     state-*.ckpt.tmp           staged baseline, cleaned on open
+#     checkpoint.json.tmp        atomic staging file for checkpoint.json
+#
+# Every change is one AJ1 frame whose body encodes the operation, the key, and
+# (for a put) the value.  The baseline is a separate streamed file written in
+# ascending key order.  Publishing never copies the delta log; it merges the
+# previous baseline with the changed keys of [old_cut, new_cut) by streaming
+# values from disk, so a publish writes at most one new baseline plus staging
+# metadata.
+#
+# Frame payload encoding (inside the AJ1 record body):
+#   1 byte  kind: 0 = put, 1 = delete
+#   1 byte  key length k (1..32)
+#   k bytes ASCII key
+#   put only: 4-byte big-endian value length n, then n value bytes
+#
+# Baseline body encoding (after a single JSON header line ending in "\n"):
+#   repeated rows in ASCII-key order, each:
+#   1 byte key length, key bytes, 4-byte value length, value bytes
+
+_CK_CHECKPOINT_NAME = "checkpoint.json"
+_CK_CHECKPOINT_TMP = "checkpoint.json.tmp"
+_CK_EVENTS_DIR = "events"
+_CK_STATE_PREFIX = "state-"
+_CK_STATE_SUFFIX = ".ckpt"
+_CK_STATE_TMP_SUFFIX = ".tmp"
+_CK_VERSION = 1
+_CK_KEY_RE = _NAME_RE
+_CK_VALUE_MAX = 1_000_000
+_CK_MAX_KEYS = 65536
+_CK_MAX_LIVE_BYTES = 64 * 1024 * 1024
+_CK_READ_LIMIT_MAX = 16
+_CK_SCAN_LIMIT = 4
+_CK_COPY_CHUNK = 256 * 1024
+_CK_KIND_PUT = 0
+_CK_KIND_DELETE = 1
+
+
+def _ck_encode(key, value):
+    raw_key = key.encode("ascii")
+    if value is None:
+        return bytes((_CK_KIND_DELETE, len(raw_key))) + raw_key
+    return (
+        bytes((_CK_KIND_PUT, len(raw_key)))
+        + raw_key
+        + len(value).to_bytes(4, "big")
+        + value
+    )
+
+
+def _ck_decode(data):
+    if len(data) < 2:
+        raise Corruption("empty change frame")
+    kind, key_length = data[0], data[1]
+    if not 1 <= key_length <= 32 or len(data) < 2 + key_length:
+        raise Corruption("malformed change frame")
+    try:
+        key = data[2:2 + key_length].decode("ascii")
+    except UnicodeDecodeError as exc:
+        raise Corruption("malformed change key") from exc
+    if not _CK_KEY_RE.fullmatch(key):
+        raise Corruption("malformed change key")
+    rest_length = len(data) - 2 - key_length
+    if kind == _CK_KIND_DELETE:
+        if rest_length:
+            raise Corruption("trailing bytes in delete frame")
+        return key, None
+    if kind != _CK_KIND_PUT:
+        raise Corruption("unknown change kind")
+    if rest_length < 4:
+        raise Corruption("truncated value length")
+    length = int.from_bytes(data[2 + key_length:2 + key_length + 4], "big")
+    if length > _CK_VALUE_MAX or rest_length != 4 + length:
+        raise Corruption("malformed value in change frame")
+    start = 2 + key_length + 4
+    return key, data[start:start + length]
+
+
+@dataclass(frozen=True)
+class Change:
+    """One decoded journal change: put (value bytes) or delete (None)."""
+
+    offset: int
+    next_offset: int
+    key: str
+    value: bytes
+
+
+def _ck_read_header(handle):
+    line = handle.readline(4096)
+    if not line.endswith(b"\n"):
+        raise Corruption("missing baseline header")
+    try:
+        header = json.loads(line.decode("utf-8"))
+    except (ValueError, UnicodeDecodeError) as exc:
+        raise Corruption("baseline header is not valid JSON") from exc
+    if not isinstance(header, dict) or header.get("version") != _CK_VERSION:
+        raise Corruption("unsupported baseline version")
+    for field in ("seq", "cut", "count", "bytes"):
+        if type(header.get(field)) is not int:
+            raise Corruption("malformed baseline header")
+    if header["seq"] < 0 or header["count"] < 0 or header["bytes"] < 0:
+        raise Corruption("malformed baseline header")
+    return header
+
+
+def _ck_iter_baseline(path):
+    """Yield (key, value_length, handle) per row, handle at the value start.
+
+    The generator seeks past any value the caller does not consume, so rows
+    can be inspected without loading their payloads.
+    """
+    with open(path, "rb") as handle:
+        header = _ck_read_header(handle)
+        for _ in range(header["count"]):
+            raw_length = handle.read(1)
+            if len(raw_length) != 1 or not 1 <= raw_length[0] <= 32:
+                raise Corruption("malformed baseline row")
+            key_length = raw_length[0]
+            raw_key = handle.read(key_length)
+            if len(raw_key) != key_length:
+                raise Corruption("truncated baseline key")
+            try:
+                key = raw_key.decode("ascii")
+            except UnicodeDecodeError as exc:
+                raise Corruption("malformed baseline key") from exc
+            if not _CK_KEY_RE.fullmatch(key):
+                raise Corruption("malformed baseline key")
+            raw_value_length = handle.read(4)
+            if len(raw_value_length) != 4:
+                raise Corruption("truncated baseline value length")
+            value_length = int.from_bytes(raw_value_length, "big")
+            if value_length > _CK_VALUE_MAX:
+                raise Corruption("oversized baseline value")
+            value_start = handle.tell()
+            yield key, value_length, handle
+            handle.seek(value_start + value_length)
+
+
+class _BootstrapRows:
+    """One-shot iterator over a baseline snapshot; closes its handle."""
+
+    def __init__(self, handle, count):
+        self._handle = handle
+        self._remaining = count
+        self._closed = False
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        if self._remaining <= 0:
+            self.close()
+            raise StopIteration
+        handle = self._handle
+        raw_length = handle.read(1)
+        if len(raw_length) != 1 or not 1 <= raw_length[0] <= 32:
+            raise Corruption("malformed baseline row")
+        key_length = raw_length[0]
+        raw_key = handle.read(key_length)
+        if len(raw_key) != key_length:
+            raise Corruption("truncated baseline key")
+        try:
+            key = raw_key.decode("ascii")
+        except UnicodeDecodeError as exc:
+            raise Corruption("malformed baseline key") from exc
+        raw_value_length = handle.read(4)
+        if len(raw_value_length) != 4:
+            raise Corruption("truncated baseline value length")
+        value_length = int.from_bytes(raw_value_length, "big")
+        if value_length > _CK_VALUE_MAX:
+            raise Corruption("oversized baseline value")
+        value = handle.read(value_length)
+        if len(value) != value_length:
+            raise Corruption("truncated baseline value")
+        self._remaining -= 1
+        return key, value
+
+    def close(self):
+        if not self._closed:
+            self._closed = True
+            self._handle.close()
+
+    def __del__(self):
+        try:
+            self.close()
+        except Exception:
+            pass
+
+
+class CheckpointJournal:
+    """Configuration change stream with a full-state baseline for newcomers.
+
+    Every :meth:`put`/:meth:`delete` appends one AJ1 frame to the underlying
+    :class:`RetainedJournal` under ``directory/events``.  :meth:`publish`
+    snapshots the complete key/value state at a chosen cut into a separate
+    baseline file; a new subscriber installs that state with
+    :meth:`bootstrap` and then continues from the same cut with :meth:`read`.
+    :meth:`prune` physically releases only the prefix that both the published
+    baseline and every external subscriber acknowledgement have passed.
+    """
+
+    def __init__(self, directory):
+        self._dir = os.fspath(directory)
+        self._closed = False
+        os.makedirs(self._dir, exist_ok=True)
+        self._checkpoint_path = os.path.join(self._dir, _CK_CHECKPOINT_NAME)
+        self._events = RetainedJournal(os.path.join(self._dir, _CK_EVENTS_DIR))
+        try:
+            self._load_checkpoint()
+            self._cleanup_stale()
+        except BaseException:
+            self._events.close()
+            raise
+
+    # -- persistence helpers ----------------------------------------------
+
+    def _fsync_dir(self):
+        dir_fd = os.open(self._dir, os.O_RDONLY)
+        try:
+            os.fsync(dir_fd)
+        finally:
+            os.close(dir_fd)
+
+    def _body_path(self, seq):
+        return os.path.join(
+            self._dir, f"{_CK_STATE_PREFIX}{seq:012d}{_CK_STATE_SUFFIX}"
+        )
+
+    def _load_checkpoint(self):
+        try:
+            with open(self._checkpoint_path, "rb") as handle:
+                raw = handle.read()
+        except FileNotFoundError:
+            self._seq = -1
+            self._cut = len(MAGIC)
+            self._count = 0
+            self._bytes = 0
+            return
+        try:
+            checkpoint = json.loads(raw.decode("utf-8"))
+        except (ValueError, UnicodeDecodeError) as exc:
+            raise Corruption("checkpoint.json is not valid JSON") from exc
+        if not isinstance(checkpoint, dict) or checkpoint.get(
+            "version"
+        ) != _CK_VERSION:
+            raise Corruption("unsupported checkpoint version")
+        try:
+            seq = checkpoint["seq"]
+            cut = checkpoint["cut"]
+            count = checkpoint["count"]
+            live_bytes = checkpoint["bytes"]
+        except KeyError as exc:
+            raise Corruption("malformed checkpoint") from exc
+        if not all(
+            type(value) is int
+            for value in (seq, cut, count, live_bytes)
+        ) or seq < 0 or count < 0 or live_bytes < 0:
+            raise Corruption("malformed checkpoint")
+        path = self._body_path(seq)
+        try:
+            with open(path, "rb") as handle:
+                header = _ck_read_header(handle)
+        except FileNotFoundError as exc:
+            raise Corruption("published baseline file is missing") from exc
+        if (
+            header["seq"] != seq
+            or header["cut"] != cut
+            or header["count"] != count
+            or header["bytes"] != live_bytes
+        ):
+            raise Corruption("checkpoint and baseline header disagree")
+        self._seq = seq
+        self._cut = cut
+        self._count = count
+        self._bytes = live_bytes
+
+    def _cleanup_stale(self):
+        keep_body = self._body_path(self._seq) if self._seq >= 0 else None
+        keep = {_CK_EVENTS_DIR, _CK_CHECKPOINT_NAME}
+        if keep_body is not None:
+            keep.add(os.path.basename(keep_body))
+        for name in os.listdir(self._dir):
+            if name in keep:
+                continue
+            is_junk = (
+                name == _CK_CHECKPOINT_TMP
+                or (
+                    name.startswith(_CK_STATE_PREFIX)
+                    and (
+                        name.endswith(_CK_STATE_SUFFIX)
+                        or name.endswith(
+                            _CK_STATE_SUFFIX + _CK_STATE_TMP_SUFFIX
+                        )
+                    )
+                )
+            )
+            if not is_junk:
+                continue
+            path = os.path.join(self._dir, name)
+            if os.path.islink(path) or not os.path.isfile(path):
+                raise Corruption(f"unexpected checkpoint entry: {name}")
+            os.unlink(path)
+        self._fsync_dir()
+
+    def _commit_checkpoint(self, seq, cut, count, live_bytes):
+        payload = json.dumps(
+            {
+                "version": _CK_VERSION,
+                "seq": seq,
+                "cut": cut,
+                "count": count,
+                "bytes": live_bytes,
+            },
+            sort_keys=True,
+        ).encode("utf-8")
+        tmp_path = os.path.join(self._dir, _CK_CHECKPOINT_TMP)
+        with open(tmp_path, "wb") as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp_path, self._checkpoint_path)
+        self._fsync_dir()
+
+    def _require_open(self):
+        if self._closed:
+            raise RuntimeError("CheckpointJournal is closed")
+
+    # -- state -------------------------------------------------------------
+
+    @property
+    def floor(self):
+        self._require_open()
+        return self._events.floor
+
+    @property
+    def end(self):
+        self._require_open()
+        return self._events.end
+
+    @property
+    def cut(self):
+        """The cursor of the published baseline."""
+        self._require_open()
+        return self._cut
+
+    # -- writes ------------------------------------------------------------
+
+    @staticmethod
+    def _validate_key(key):
+        if not isinstance(key, str) or not _CK_KEY_RE.fullmatch(key):
+            raise ValueError(
+                "key must be 1-32 case-sensitive ASCII letters, digits, "
+                "'_' or '-'"
+            )
+
+    def put(self, key, value):
+        """Append a put change and return its frame's logical start offset."""
+        self._require_open()
+        self._validate_key(key)
+        if type(value) is not bytes or len(value) > _CK_VALUE_MAX:
+            raise ValueError(
+                f"value must be bytes of at most {_CK_VALUE_MAX} bytes"
+            )
+        return self._events.append(_ck_encode(key, value))
+
+    def delete(self, key):
+        """Append a delete change (even for an absent key); return its offset."""
+        self._require_open()
+        self._validate_key(key)
+        return self._events.append(_ck_encode(key, None))
+
+    def read(self, offset, *, limit=16):
+        """Return up to ``limit`` contiguous changes starting at ``offset``."""
+        self._require_open()
+        if type(offset) is not int:
+            raise ValueError("offset must be a true integer")
+        if (
+            type(limit) is not int
+            or not 1 <= limit <= _CK_READ_LIMIT_MAX
+        ):
+            raise ValueError("limit must be an integer from 1 through 16")
+        rows = self._events.read(offset, limit=limit)
+        changes = []
+        for row in rows:
+            key, value = _ck_decode(row.data)
+            changes.append(Change(row.offset, row.next_offset, key, value))
+        return changes
+
+    # -- subscribers -------------------------------------------------------
+
+    def register(self, name):
+        self._require_open()
+        return self._events.register(name)
+
+    def checkpoint(self, name):
+        self._require_open()
+        return self._events.checkpoint(name)
+
+    def ack(self, name, next_offset):
+        self._require_open()
+        self._events.ack(name, next_offset)
+
+    def drop(self, name):
+        self._require_open()
+        return self._events.drop(name)
+
+    # -- baseline publication ---------------------------------------------
+
+    def _scan_deltas(self, cut):
+        """Return {key: (last_frame_offset_or_None, value_length)} at ``cut``."""
+        touched = {}
+        offset = self._cut
+        while offset < cut:
+            rows = self._events.read(offset, limit=_CK_SCAN_LIMIT)
+            if not rows:
+                raise Corruption("delta scan reached end before the cut point")
+            progressed = False
+            for row in rows:
+                if row.offset >= cut:
+                    break
+                key, value = _ck_decode(row.data)
+                touched[key] = (
+                    row.offset if value is not None else None,
+                    len(value) if value is not None else 0,
+                )
+                offset = row.next_offset
+                progressed = True
+            if not progressed:
+                raise Corruption("delta scan made no progress")
+        if offset != cut:
+            raise Corruption("delta scan did not land on the cut point")
+        return touched
+
+    def _write_merged(self, out, touched, old_body):
+        """Write the complete state at the new cut, streaming large values."""
+        keys = sorted(touched)
+        index = 0
+        rows = _ck_iter_baseline(old_body) if old_body is not None else iter(())
+        old = next(rows, None)
+        while old is not None or index < len(keys):
+            if old is None:
+                self._write_touched(out, touched, keys[index])
+                index += 1
+                continue
+            if index >= len(keys):
+                self._write_old_row(out, old)
+                old = next(rows, None)
+                continue
+            old_key, _old_length, _handle = old
+            key = keys[index]
+            if old_key < key:
+                self._write_old_row(out, old)
+                old = next(rows, None)
+            elif old_key == key:
+                # The delta supersedes this old row; write it from the delta
+                # (or omit it for a delete) and move past the old row.
+                self._write_touched(out, touched, key)
+                index += 1
+                old = next(rows, None)
+            else:
+                # Touched key sorts before the old row; keep the old row.
+                self._write_touched(out, touched, key)
+                index += 1
+
+    def _write_old_row(self, out, old):
+        old_key, old_length, handle = old
+        out.write(bytes((len(old_key),)) + old_key.encode("ascii"))
+        out.write(old_length.to_bytes(4, "big"))
+        remaining = old_length
+        while remaining:
+            chunk = handle.read(min(_CK_COPY_CHUNK, remaining))
+            if not chunk:
+                raise Corruption("truncated baseline value")
+            out.write(chunk)
+            remaining -= len(chunk)
+
+    def _write_touched(self, out, touched, key):
+        offset, _length = touched[key]
+        if offset is None:
+            return
+        rows = self._events.read(offset, limit=1)
+        if not rows:
+            raise Corruption("touched frame vanished")
+        frame_key, value = _ck_decode(rows[0].data)
+        if frame_key != key or value is None:
+            raise Corruption("touched frame does not match its key")
+        raw_key = key.encode("ascii")
+        out.write(bytes((len(raw_key),)) + raw_key)
+        out.write(len(value).to_bytes(4, "big"))
+        out.write(value)
+
+    def publish(self, cut):
+        """Publish the complete state at ``cut`` and return that cursor."""
+        self._require_open()
+        if type(cut) is not int:
+            raise ValueError("cut must be a true integer offset")
+        if cut < self._cut:
+            raise ValueError("cut cannot move before the published baseline")
+        end = self._events.end
+        if cut > end:
+            raise ValueError("cut is beyond the end of the journal")
+        if cut != end and not self._events._is_boundary(cut):
+            raise ValueError("cut is not a frame boundary")
+        if cut == self._cut:
+            return self._cut
+
+        touched = self._scan_deltas(cut)
+        old_body = self._body_path(self._seq) if self._seq >= 0 else None
+
+        old_sizes = {}
+        if old_body is not None:
+            for key, length, _handle in _ck_iter_baseline(old_body):
+                if key in touched:
+                    old_sizes[key] = length
+
+        new_count = self._count
+        new_bytes = self._bytes
+        for key, (offset, length) in touched.items():
+            old_length = old_sizes.get(key)
+            if old_length is not None:
+                new_count -= 1
+                new_bytes -= len(key) + old_length
+            if offset is not None:
+                new_count += 1
+                new_bytes += len(key) + length
+        if new_count > _CK_MAX_KEYS:
+            raise ValueError("baseline would exceed 65,536 live keys")
+        if new_bytes > _CK_MAX_LIVE_BYTES:
+            raise ValueError("baseline would exceed 64 MiB of live values")
+
+        seq = self._seq + 1
+        path = self._body_path(seq)
+        tmp_path = path + _CK_STATE_TMP_SUFFIX
+        try:
+            with open(tmp_path, "wb") as out:
+                header = json.dumps(
+                    {
+                        "version": _CK_VERSION,
+                        "seq": seq,
+                        "cut": cut,
+                        "count": new_count,
+                        "bytes": new_bytes,
+                    },
+                    sort_keys=True,
+                ).encode("utf-8")
+                out.write(header + b"\n")
+                self._write_merged(out, touched, old_body)
+                out.flush()
+                os.fsync(out.fileno())
+            os.replace(tmp_path, path)
+            self._fsync_dir()
+        except BaseException:
+            try:
+                os.unlink(tmp_path)
+            except FileNotFoundError:
+                pass
+            raise
+
+        try:
+            self._commit_checkpoint(seq, cut, new_count, new_bytes)
+        except BaseException:
+            # The rename inside _commit_checkpoint may or may not have taken
+            # effect.  Never delete the staged body here: if the checkpoint
+            # does reference it, deleting would corrupt the directory; if it
+            # does not, the file is unreferenced and removed on the next open.
+            # This handle is unusable after a failed commit.
+            self._closed = True
+            self._events.close()
+            raise
+
+        self._seq = seq
+        self._cut = cut
+        self._count = new_count
+        self._bytes = new_bytes
+        if old_body is not None:
+            try:
+                os.unlink(old_body)
+            except FileNotFoundError:
+                pass
+            self._fsync_dir()
+        return cut
+
+    def bootstrap(self):
+        """Return ``(cut, rows)``: the published cursor and its key/value rows.
+
+        ``rows`` is a one-shot iterator of ``(key, value)`` pairs in ASCII key
+        order.  Reading it does not advance any acknowledgement.  The caller
+        must finish or discard it before issuing other calls on this handle.
+        """
+        self._require_open()
+        if self._seq < 0:
+            return self._cut, iter(())
+        path = self._body_path(self._seq)
+        handle = open(path, "rb")
+        try:
+            header = _ck_read_header(handle)
+            if (
+                header["seq"] != self._seq
+                or header["cut"] != self._cut
+                or header["count"] != self._count
+            ):
+                raise Corruption("baseline header disagrees with the checkpoint")
+        except BaseException:
+            handle.close()
+            raise
+        return self._cut, _BootstrapRows(handle, self._count)
+
+    # -- reclamation -------------------------------------------------------
+
+    def prune(self):
+        """Physically release the prefix below the safe cut; return the floor."""
+        self._require_open()
+        boundary = self._cut
+        for position in self._events._consumers.values():
+            if position < boundary:
+                boundary = position
+        return self._events._prune_to(boundary)
+
+    # -- lifecycle ---------------------------------------------------------
+
+    def close(self):
+        if self._closed:
+            return
+        self._closed = True
+        self._events.close()
 
     def __enter__(self):
         return self

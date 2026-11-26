@@ -195,3 +195,80 @@ directory/
 `SIGKILL` 重开一致性，以及 48 MiB `RLIMIT_AS` 子进程中 54 个近 1 MiB 帧积压
 下 `claim` 的读取量与正确性。
 
+
+# 带状态基线的配置变更流 CheckpointJournal
+
+`CheckpointJournal(directory)` 在独立目录上把配置变更记录为增量日志，并为
+新订阅者提供某个明确切点的完整键值状态。它支持上下文管理，只使用标准库；
+增量帧写入 `directory/events` 下的现有 `RetainedJournal`，其接口、帧格式与
+行为不变。同一目录只允许一个活动句柄（由 `events` 的 `lock` 保证）。
+
+```python
+from journal import CheckpointJournal, ExpiredOffset
+
+with CheckpointJournal("./run/config") as log:
+    log.put("theme", b"dark")          # 返回该帧的逻辑起点
+    log.put("accent", b"")
+    a = log.put("font", b"serif")
+    log.delete("accent")               # 删除不存在/空值键也会追加删除帧
+    cut = log.end
+    log.publish(cut)                   # 发布 cut 之前的完整状态
+    log.put("font", b"sans")           # cut 之后的写入不进入这一版基线
+
+    new_cut, rows = log.bootstrap()    # 新订阅者：装入 (key, value) 行
+    for key, value in rows:            # 按键的 ASCII 顺序，每个活键恰好一次
+        ...
+    for change in log.read(new_cut, limit=16):
+        ...                            # change.offset/next_offset/key/value
+```
+
+- 写入：`put(key, value)` / `delete(key)` 各追加一条 AJ1 帧（载荷编码操作、
+  键和可选值），返回帧的逻辑起点。键为区分大小写的 1–32 个 ASCII 字母、数字、
+  `_` 或 `-`；值为至多 1,000,000 字节的 `bytes`，可为空。沿用底层 65,536 帧、
+  64 MiB 可读编码和有符号 64 位末端上限；非法参数或超限抛 `ValueError`
+  且不追加帧。只读的 `floor`、`end` 是底层真实边界。
+- 读取：`read(offset, *, limit=16)` 返回最多 16 条连续变更（`Change` 的
+  `offset`、`next_offset`、`key`、`value`，删除的 `value` 为 `None`）。
+  `offset` 规则同底层：等于 `end` 返回空，低于 `floor` 抛 `ExpiredOffset`，
+  帧内或越界抛 `ValueError`。布尔值不算整数。
+- 基线：`publish(cut) -> int` 把 cut 之前所有变更生效后的完整键值状态发布为
+  新基线并返回 cut。cut 必须在旧基线游标与当前 `end` 之间，且是帧起点或
+  `end`；初始基线为空、游标为 4。同点重试不改状态；非法切点、倒退，或结果
+  超过 65,536 个活键或 64 MiB（按活键 ASCII 字节数与值字节数之和计）抛
+  `ValueError`，原基线、日志与确认全部保留。写入时不按基线大小拒绝，因此可
+  先写删除再发布更大的切点。cut 处及之后的改写/删除不影响该版状态；前缀回收
+  后再发布，未被后续变更触及的旧键仍保留。
+- 引导：`bootstrap() -> (cut, rows)` 返回当前基线游标与可逐行遍历一次的
+  `(key, value)` 迭代器（空值返回，删除键不返回）。它不推进任何确认，也不
+  需要旧版基线句柄；调用方在同一句柄内读完或丢弃后再执行其他操作。
+- 在线订阅：`register(name)`、`ack(name, next_offset)`、`drop(name)` 直接沿用
+  底层语义（至多 16 个，注册从当前 `floor` 起步，重复注册不移动确认，单向
+  确认，未知名称抛 `KeyError`）。注册/确认/注销/发布都不移动 `floor`。
+- 回收：`prune() -> int` 实际回收前缀并返回新 `floor`，上限为已发布基线的
+  cut 与所有外部确认的最小值（无外部订阅者时只受基线约束）。它复用
+  `RetainedJournal` 的物理回收，幸存帧保持原字节游标；不另存已回收增量的
+  完整副本。
+
+空间与写入放大：发布以流式合并旧基线与 `[旧游标, cut)` 内被触及的键，写入
+新基线时逐块复制未改动的值，不把大值整体载入内存，也不复制增量日志。因此一次
+成功的 `publish` 新增写到磁盘的字节数约为新基线的字节数加少量元数据，即使旧
+基线很大、新基线很小亦然。发布或拒绝后不保留废弃的暂存副本。
+
+目录布局（实现细节，可能调整）：
+
+```
+directory/
+  events/                    增量日志：每变更一个 AJ1 帧的 RetainedJournal
+  checkpoint.json            已提交的基线序号、cut 与统计
+  state-NNNNNNNNNNNN.ckpt    该 cut 的完整状态（流式编码）
+  state-*.ckpt.tmp           暂存基线，打开时清理
+  checkpoint.json.tmp        checkpoint.json 的原子替换暂存文件
+```
+
+tests：`test_checkpoint_journal.py` 覆盖切点前后状态、空值与删除、非法切点
+与倒退、订阅确认对回收的约束、关闭后用原 `RetainedJournal` 核对真实 floor /
+过期游标 / 幸存帧、重开接续；一个随机模型测试逐项比对基线；以及在 Linux
+子进程 48 MiB `RLIMIT_AS` 下生成 56+ 个近 1 MiB 值、验证未发布时 `prune`
+不能让写入成功、发布并回收后新帧落在旧 `end`、超容量拒绝、删除后从旧基线
+重新发布、并把 >48 MiB 基线缩到两个值，按 `/proc/self/io` 的 `wchar` 差值
+验收该次发布的写入量。
