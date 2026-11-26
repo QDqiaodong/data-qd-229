@@ -120,3 +120,78 @@ with ReplicaJournal(
 `test_replica_journal.py` 覆盖 A–H 乱序/重复/冲突/预算/重开场景，并在 Linux
 子进程的 40 MiB `RLIMIT_AS` 中验证 48 个近 1 MiB 帧、块占用和分批回放。
 
+# 按设备顺序派发的 LeasedWorkJournal
+
+`LeasedWorkJournal(directory, *, hook=None)` 在独立目录上实现带租约的任务
+队列：同一设备（`key`）的任务严格按提交顺序派发，一台设备的工作进程失联只
+挡住它自己，不影响其他设备。任务正文逐帧写入 `directory/events` 下的
+`RetainedJournal`，它是唯一的权威任务日志；租约与完成状态另存
+`directory/leases.json`，全部状态都在本目录内，只使用标准库，支持上下文
+管理，同一时刻仍只允许一个活动句柄。
+
+```python
+from journal import LeasedWorkJournal
+
+with LeasedWorkJournal("./run/work") as queue:
+    first = queue.submit("device-A", b"op-1")   # -> 帧字节偏移，即任务编号
+    queue.submit("device-A", b"op-2")
+    queue.submit("device-B", b"op-3")
+    dispatch = queue.claim(now=100, ttl=30)     # 选可领设备头中偏移最小者
+    try:
+        ...                                       # 调用方自行执行设备操作
+    finally:
+        if queue.finish(dispatch.receipt, now=105):
+            queue.reclaim()                      # 回收连续已完成前缀的正文
+```
+
+- `submit(key, data) -> int`：`key` 为区分大小写的 1–32 个 ASCII 字母、数字、
+  `_` 或 `-`；`data` 为至多 1,000,000 字节的 `bytes`，可为空。沿用底层
+  65,536 帧、64 MiB 可读编码与有符号 64 位末端边界，已完成但尚未回收的帧
+  同样占用配额；任何参数/配额拒绝都不会多写一帧。
+- `claim(now, ttl) -> Dispatch | None`：从各设备尚未完成的首条任务中选出当前
+  可领且偏移最小者；某设备首条任务持有有效租约时，该设备后续任务不可领取，
+  其他设备照常。`Dispatch` 含 `offset`、`key`、`data`、`receipt`、`deadline`
+  五个只读属性，`deadline = now + ttl`，有效区间不含 `deadline`。`now` 为
+  0 至 2**62−1 的真整数（布尔值不算），`ttl` 为 1 至 86,400 的真整数；库不
+  读系统时钟、不睡眠等待过期，由调用方保证同目录时钟不倒退。每次成功领取都
+  签发队列内不复用的新非空 `receipt`；到期重领同一偏移也会换发凭据。
+- `finish(receipt, now) -> bool`：只接受对应任务当前且未到期的凭据，成功则
+  永久完成该任务并返回 `True`。超时、已被替换、已使用或不属于当前领取的凭据
+  一律返回 `False`，且不会完成任务、顶替其他凭据或释放日志；凭据类型错误/
+  为空、`now` 非法抛 `ValueError` 且不留状态变化。
+- `reclaim() -> int`：只真实回收连续已完成的前缀并返回回收后的 `floor`；后面
+  的设备任务即使已完成，也不能越过一条仍未完成的老任务被回收，阻塞任务完成
+  后再次调用才会连同后续连续已完成帧一起释放。`finish` 本身不做物理回收。
+  重开不改变偏移、不让已完成任务重新可领；回收到空后仍按旧 `end` 继续追加。
+  只读的 `floor`、`end` 分别反映权威日志的最早可读偏移与追加末端。
+- 租约、截止时间、设备阻挡随 `leases.json` 持久化：成功领取后关闭重开，原凭据
+  仍可在有效期内确认，不会因重开另发凭据。迟到的旧凭据回报在租约超时并被替换
+  后只会得到 `False`，无法把当前任务从队列里删掉。
+- `hook` 可选：提交在底层 append 已 fsync 之后、返回编号之前回调
+  `hook("after_payload_sync")`；完成在完成决定已持久化之后、返回 `True` 之前
+  回调 `hook("after_finish_commit")`。回调中直接结束进程也保持一致：前者重开后
+  任务恰好保留一份且可领，后者重开后任务不复活并可参与下一次前缀回收。
+- 大积压：打开时以小批量流式扫描重建只含设备键与偏移的内存索引，不缓存任务
+  正文。因此在开好的队列上，即使有超过 50 MiB 的同设备积压、绝大多数帧被该
+  设备首条任务的有效租约挡住，单次 `claim` 也只读取最终命中的那一帧（实测
+  `/proc/self/io` 的 `rchar` 增量为数百字节量级，上限 2 MiB）；准备积压、
+  重开加领取可在 48 MiB 地址空间限制的新 Python 进程中完成。
+
+目录布局（实现细节，可能调整）：
+
+```
+directory/
+  events/           权威 RetainedJournal：每任务一个 AJ1 帧，偏移即任务编号
+  leases.json       凭据计数、当前有效租约（偏移 -> [凭据, 截止时间]）、完成偏移
+  leases.json.tmp   leases.json 的原子替换暂存文件
+```
+
+任务帧正文编码为 1 字节键长度、ASCII 键、随后原始 `data`；外部设备操作是否
+恰好执行一次不由本队列保证，重复领取/确认的幂等由调用方结合凭据处理。
+
+测试：`test_leased_work_journal.py` 覆盖 A/A/B 完整派发-重开-超时重领-回收
+流程（并用原 `RetainedJournal` 核对真实切点与过期游标）、空任务与回收到空后
+继续提交、凭据与时钟参数校验、配额拒绝与回收恢复、两个回调点的真实子进程
+`SIGKILL` 重开一致性，以及 48 MiB `RLIMIT_AS` 子进程中 54 个近 1 MiB 帧积压
+下 `claim` 的读取量与正确性。
+

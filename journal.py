@@ -1179,3 +1179,429 @@ class RetainedJournal:
 
     def __exit__(self, *_):
         self.close()
+
+
+# --- LeasedWorkJournal: per-device ordered task dispatch ------------------
+# Directory layout (implementation details):
+#   directory/
+#     events/           authoritative RetainedJournal, one AJ1 frame per task
+#     leases.json       receipt counter, current leases, finished offsets
+#     leases.json.tmp   atomic staging file for leases.json
+#
+# The events journal is the sole authority for task payloads and offsets.
+# leases.json only remembers dispatch state; on open it is reconciled against
+# a full streaming scan of events, so a process killed between the durable
+# append and the next state write loses nothing.
+#
+# Task frame payload encoding (inside the AJ1 record body):
+#   1 byte  key length k (1..32)
+#   k bytes ASCII key
+#   n bytes task data (n may be 0; k + 1 + n <= 1,048,576)
+
+_LEASED_EVENTS_DIR = "events"
+_LEASED_STATE_NAME = "leases.json"
+_LEASED_STATE_TMP = "leases.json.tmp"
+_LEASED_CONSUMER = "leased-work"
+_LEASED_KEY_RE = re.compile(r"[A-Za-z0-9_-]{1,32}\Z")
+_LEASED_MAX_DATA = 1_000_000
+_LEASED_MAX_TTL = 86_400
+_LEASED_NOW_MAX = (1 << 62) - 1
+_LEASED_STATE_VERSION = 1
+_LEASED_SCAN_BATCH = 4
+
+
+@dataclass(frozen=True)
+class Dispatch:
+    """One leased task: where it lives, which device it belongs to, the
+    caller's payload, and the receipt that alone can finish it."""
+
+    offset: int
+    key: str
+    data: bytes
+    receipt: str
+    deadline: int
+
+
+class _LeasedTask:
+    __slots__ = ("offset", "key", "done", "receipt", "deadline")
+
+    def __init__(self, offset, key):
+        self.offset = offset
+        self.key = key
+        self.done = False
+        self.receipt = None
+        self.deadline = None
+
+
+def _encode_task(key, data):
+    raw_key = key.encode("ascii")
+    return bytes((len(raw_key),)) + raw_key + data
+
+
+def _split_task(payload):
+    if not payload:
+        raise Corruption("empty task frame")
+    key_length = payload[0]
+    if key_length < 1 or 1 + key_length > len(payload):
+        raise Corruption("malformed task frame")
+    try:
+        key = payload[1:1 + key_length].decode("ascii")
+    except UnicodeDecodeError as exc:
+        raise Corruption("malformed task key") from exc
+    return key, payload[1 + key_length:]
+
+
+class LeasedWorkJournal:
+    """Dispatch durable per-device task queues with expiring leases.
+
+    One task is one frame in a :class:`RetainedJournal` under
+    ``directory/events``; tasks for the same key are dispatched strictly in
+    submission order, while a lost worker only blocks its own device.  The
+    caller performs the actual device operation: this class handles dispatch,
+    acknowledgement, and prefix reclamation, and does not promise exactly-once
+    execution of the external operation.
+    """
+
+    def __init__(self, directory, *, hook=None):
+        if hook is not None and not callable(hook):
+            raise ValueError("hook must be callable")
+        self._dir = os.fspath(directory)
+        self._hook = hook
+        self._closed = False
+        os.makedirs(self._dir, exist_ok=True)
+        # The events journal's own flock provides the single-active-handle
+        # guarantee for the whole queue.
+        self._journal = RetainedJournal(
+            os.path.join(self._dir, _LEASED_EVENTS_DIR)
+        )
+        try:
+            self._rebuild()
+        except BaseException:
+            self._journal.close()
+            raise
+
+    # -- opening / state reconstruction ------------------------------------
+
+    def _rebuild(self):
+        # In-memory index.  Payloads are streamed in small batches and only
+        # the device keys are retained, so reopening a multi-ten-MiB backlog
+        # never holds the payloads in memory.
+        self._tasks = {}        # offset -> _LeasedTask
+        self._order = []        # frame offsets at/after floor, sorted
+        self._by_key = {}       # key -> list[offset] in submission order
+        self._head_pos = {}     # key -> first possibly unfinished index
+        self._receipts = {}     # receipt -> offset
+        self._counter = 0
+
+        journal = self._journal
+        offset = journal.floor
+        end = journal.end
+        while offset < end:
+            rows = journal.read(offset, limit=_LEASED_SCAN_BATCH)
+            if not rows:
+                raise Corruption("task scan ended before the journal end")
+            for row in rows:
+                key, _data = _split_task(row.data)
+                self._tasks[row.offset] = _LeasedTask(row.offset, key)
+                self._order.append(row.offset)
+                self._by_key.setdefault(key, []).append(row.offset)
+                offset = row.next_offset
+
+        state = self._load_state()
+        if state is not None:
+            self._counter = state["counter"]
+            for finished in state["done"]:
+                task = self._tasks.get(finished)
+                if task is not None:
+                    task.done = True
+            for leased_offset, (receipt, deadline) in state["leases"].items():
+                task = self._tasks.get(leased_offset)
+                # Entries below the retained floor or beyond the log are
+                # stale reconciliation leftovers; silently drop them.
+                if task is None or task.done:
+                    continue
+                task.receipt = receipt
+                task.deadline = deadline
+                self._receipts[receipt] = leased_offset
+
+        for key, offsets in self._by_key.items():
+            position = 0
+            while position < len(offsets) and self._tasks[
+                offsets[position]
+            ].done:
+                position += 1
+            self._head_pos[key] = position
+
+    def _load_state(self):
+        tmp_path = os.path.join(self._dir, _LEASED_STATE_TMP)
+        try:
+            os.unlink(tmp_path)
+        except FileNotFoundError:
+            pass
+        state_path = os.path.join(self._dir, _LEASED_STATE_NAME)
+        try:
+            with open(state_path, "rb") as handle:
+                raw = handle.read()
+        except FileNotFoundError:
+            return None
+        try:
+            state = json.loads(raw.decode("utf-8"))
+        except (ValueError, UnicodeDecodeError) as exc:
+            raise Corruption("leases state is not valid JSON") from exc
+        if not isinstance(state, dict) or state.get(
+            "version"
+        ) != _LEASED_STATE_VERSION:
+            raise Corruption("unsupported leases state version")
+        try:
+            counter = state["counter"]
+            if type(counter) is not int:
+                raise Corruption("malformed lease counter")
+            done = []
+            for offset in state["done"]:
+                if type(offset) is not int:
+                    raise Corruption("malformed finished offset")
+                done.append(offset)
+            leases = {}
+            for offset_raw, entry in dict(state["leases"]).items():
+                if not isinstance(entry, list) or len(entry) != 2:
+                    raise Corruption("malformed lease entry")
+                receipt, deadline = entry
+                if not isinstance(receipt, str) or not receipt:
+                    raise Corruption("malformed lease receipt")
+                if type(deadline) is not int:
+                    raise Corruption("malformed lease deadline")
+                leases[int(offset_raw)] = (receipt, deadline)
+        except (KeyError, TypeError, ValueError) as exc:
+            raise Corruption("malformed leases state") from exc
+        if counter < 0 or any(offset < len(MAGIC) for offset in done):
+            raise Corruption("malformed leases state")
+        return {"counter": counter, "done": done, "leases": leases}
+
+    def _persist_state(self):
+        leases = {}
+        done = []
+        for offset in self._order:
+            task = self._tasks[offset]
+            if task.done:
+                done.append(offset)
+            elif task.receipt is not None:
+                leases[str(offset)] = [task.receipt, task.deadline]
+        payload = json.dumps(
+            {
+                "version": _LEASED_STATE_VERSION,
+                "counter": self._counter,
+                "leases": leases,
+                "done": done,
+            },
+            sort_keys=True,
+        ).encode("utf-8")
+        tmp_path = os.path.join(self._dir, _LEASED_STATE_TMP)
+        state_path = os.path.join(self._dir, _LEASED_STATE_NAME)
+        with open(tmp_path, "wb") as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp_path, state_path)
+        self._fsync_dir()
+
+    def _fsync_dir(self):
+        dir_fd = os.open(self._dir, os.O_RDONLY)
+        try:
+            os.fsync(dir_fd)
+        finally:
+            os.close(dir_fd)
+
+    # -- validation --------------------------------------------------------
+
+    @staticmethod
+    def _validate_key(key):
+        if not isinstance(key, str) or not _LEASED_KEY_RE.fullmatch(key):
+            raise ValueError(
+                "key must be 1-32 case-sensitive ASCII letters, digits, "
+                "'_' or '-'"
+            )
+
+    @staticmethod
+    def _validate_data(data):
+        if type(data) is not bytes or len(data) > _LEASED_MAX_DATA:
+            raise ValueError(
+                f"data must be bytes of at most {_LEASED_MAX_DATA} bytes"
+            )
+
+    @staticmethod
+    def _validate_clock(now, ttl):
+        if type(now) is not int or not 0 <= now <= _LEASED_NOW_MAX:
+            raise ValueError("now must be a true integer in [0, 2**62-1]")
+        if type(ttl) is not int or not 1 <= ttl <= _LEASED_MAX_TTL:
+            raise ValueError("ttl must be a true integer in [1, 86400]")
+
+    def _require_open(self):
+        if self._closed:
+            raise RuntimeError("LeasedWorkJournal is closed")
+
+    # -- state -------------------------------------------------------------
+
+    @property
+    def floor(self):
+        self._require_open()
+        return self._journal.floor
+
+    @property
+    def end(self):
+        self._require_open()
+        return self._journal.end
+
+    # -- enqueue -----------------------------------------------------------
+
+    def submit(self, key, data):
+        """Append one task and return its frame offset (its task number)."""
+        self._require_open()
+        self._validate_key(key)
+        self._validate_data(data)
+        # RetainedJournal rejects frame/byte/int64 quota breaches itself,
+        # always before appending anything, so no partial task is created.
+        offset = self._journal.append(_encode_task(key, data))
+        self._tasks[offset] = _LeasedTask(offset, key)
+        self._order.append(offset)
+        self._by_key.setdefault(key, []).append(offset)
+        if key not in self._head_pos:
+            self._head_pos[key] = 0
+        if self._hook is not None:
+            # The payload append is already synced at this point.
+            self._hook("after_payload_sync")
+        return offset
+
+    # -- dispatch ----------------------------------------------------------
+
+    def claim(self, now, ttl):
+        """Lease the smallest-offset claimable per-device head, or None."""
+        self._require_open()
+        self._validate_clock(now, ttl)
+        best = None
+        for key, position in self._head_pos.items():
+            offsets = self._by_key[key]
+            if position >= len(offsets):
+                continue  # every task for this device is finished
+            task = self._tasks[offsets[position]]
+            if task.receipt is not None and now < task.deadline:
+                continue  # valid lease blocks this whole device
+            if best is None or task.offset < best.offset:
+                best = task
+        if best is None:
+            return None
+
+        if best.receipt is not None:
+            # The previous lease has expired; retire its receipt before the
+            # replacement is issued so the late acknowledgement can never
+            # resolve to this task again.
+            self._receipts.pop(best.receipt, None)
+        self._counter += 1
+        receipt = f"R{self._counter:010d}-{best.offset}"
+        deadline = now + ttl
+        best.receipt = receipt
+        best.deadline = deadline
+        self._receipts[receipt] = best.offset
+        self._persist_state()
+
+        rows = self._journal.read(best.offset, limit=1)
+        if not rows:
+            raise Corruption("claimed task frame vanished")
+        _key, data = _split_task(rows[0].data)
+        return Dispatch(best.offset, best.key, data, receipt, deadline)
+
+    def finish(self, receipt, now):
+        """Finish a task only with its current, unexpired receipt."""
+        self._require_open()
+        if not isinstance(receipt, str) or not receipt:
+            raise ValueError("receipt must be a non-empty string")
+        if type(now) is not int or not 0 <= now <= _LEASED_NOW_MAX:
+            raise ValueError("now must be a true integer in [0, 2**62-1]")
+
+        offset = self._receipts.get(receipt)
+        if offset is None:
+            return False
+        task = self._tasks[offset]
+        # The lease interval excludes the deadline itself.
+        if task.done or task.receipt != receipt or now >= task.deadline:
+            return False
+
+        task.done = True
+        task.receipt = None
+        task.deadline = None
+        del self._receipts[receipt]
+        self._advance_head(task.key)
+        self._persist_state()
+        if self._hook is not None:
+            # The completion decision is already durable at this point.
+            self._hook("after_finish_commit")
+        return True
+
+    def _advance_head(self, key):
+        offsets = self._by_key[key]
+        position = self._head_pos[key]
+        while position < len(offsets) and self._tasks[
+            offsets[position]
+        ].done:
+            position += 1
+        self._head_pos[key] = position
+
+    # -- reclamation -------------------------------------------------------
+
+    def reclaim(self):
+        """Physically release the contiguous finished prefix; return floor."""
+        self._require_open()
+        floor = self._journal.floor
+        target = floor
+        for index, offset in enumerate(self._order):
+            task = self._tasks[offset]
+            if not task.done:
+                break
+            if index + 1 < len(self._order):
+                target = self._order[index + 1]
+            else:
+                target = self._journal.end
+        if target == floor:
+            return floor
+
+        # Drive the underlying journal through its own consumer cursor so the
+        # cut point stays a real, independently inspectable RetainedJournal
+        # commit.  A finished later device can never jump an unfinished older
+        # frame because target is built from a strict prefix walk.
+        self._journal.register(_LEASED_CONSUMER)
+        self._journal.ack(_LEASED_CONSUMER, target)
+        new_floor = self._journal.prune()
+
+        self._order = [
+            offset for offset in self._order if offset >= new_floor
+        ]
+        for offset in list(self._tasks):
+            if offset < new_floor:
+                del self._tasks[offset]
+        by_key = {}
+        for offset in self._order:
+            by_key.setdefault(self._tasks[offset].key, []).append(offset)
+        self._by_key = by_key
+        self._head_pos = {}
+        for key, offsets in by_key.items():
+            position = 0
+            while position < len(offsets) and self._tasks[
+                offsets[position]
+            ].done:
+                position += 1
+            self._head_pos[key] = position
+        self._persist_state()
+        return new_floor
+
+    # -- lifecycle ---------------------------------------------------------
+
+    def close(self):
+        if self._closed:
+            return
+        self._closed = True
+        self._journal.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_exc):
+        self.close()
