@@ -19,6 +19,14 @@ class Corruption(ValueError):
     pass
 
 
+class DamagedFrame(Corruption):
+    """A read touched a complete frame whose body checksum is known bad."""
+
+    def __init__(self, offset):
+        self.offset = offset
+        super().__init__(f"damaged frame at byte {offset}")
+
+
 @dataclass(frozen=True)
 class Record:
     offset: int
@@ -614,6 +622,45 @@ _MAX_READABLE_BYTES = 64 * 1024 * 1024
 _SEGMENT_CAP = 256 * 1024
 _MANIFEST_VERSION = 1
 
+# Repair support.  Only the bodies of complete, sealed frames are ever
+# replaced; frame headers, frame lengths, logical offsets, the append segment
+# and the manifest are never touched, so ordinary strict-mode readers observe
+# the corrected AJ1 bytes at the original cursors.
+#
+# A batch may span several segment files but must take effect as a whole.  It
+# is applied in place under two durable markers:
+#
+#   repair.intent   written and fsynced BEFORE any target byte changes.  For
+#                   each changed frame it records the exact physical location
+#                   and the original body bytes (an undo log of at most T
+#                   bytes), so a crash while the batch is in flight can restore
+#                   the pre-repair state.
+#
+#   repair.commit   written only AFTER every corrected body is in place and
+#                   fsynced.  Its atomic rename is the point of no return: once
+#                   present the batch is complete and a reopen just discards
+#                   both markers, keeping the new bytes.
+#
+# Reopen resolves the pair before the journal is exposed (or before strict mode
+# refuses to open):
+#   * intent without commit -> the batch never committed; write every original
+#     body back from the undo log, fsync, drop the intent (old state);
+#   * commit present        -> the batch is complete; drop both markers (new
+#     state).  The undo log is no longer consulted.
+# Space: the intent holds at most T bytes and an in-place patch rewrites T
+# bytes, so no segment copy is ever made and the directory grows by at most
+# T + small; a rollback rewrites at most T more, keeping cumulative writes
+# (intent T + patch ≤ T + rollback T = 3T ≤ 2T + 3 MiB) within budget.
+_REPAIR_INTENT_NAME = "repair.intent"
+_REPAIR_COMMIT_NAME = "repair.commit"
+_REPAIR_INTENT_MAGIC = b"AJRP1\n"
+_REPAIR_COMMIT_MAGIC = b"AJPC1\n"
+_REPAIR_MAX_ITEMS = 8
+_REPAIR_MAX_BYTES = 2 * 1024 * 1024
+_REPAIR_COUNT = Struct(">I")
+_REPAIR_NAME_COUNTS = Struct(">H H")
+_REPAIR_ENTRY = Struct(">I I I")
+
 
 class RetainedJournal:
     """Directory-backed journal with consumer-cursor-driven physical pruning.
@@ -623,11 +670,19 @@ class RetainedJournal:
     offset 4 and pruning only advances ``floor``; it never reuses offsets.
     """
 
-    def __init__(self, directory, *, prune_hook=None):
-        self._dir = os.fspath(directory)
+    def __init__(self, directory, *, prune_hook=None, repair_mode=False,
+                 repair_hook=None):
         if prune_hook is not None and not callable(prune_hook):
             raise ValueError("prune_hook must be callable")
+        if repair_hook is not None and not callable(repair_hook):
+            raise ValueError("repair_hook must be callable")
         self._prune_hook = prune_hook
+        self._repair_mode = bool(repair_mode)
+        self._repair_hook = repair_hook
+        # Frame starts of complete sealed frames whose body CRC is currently
+        # bad, ascending.  Only populated in repair mode.
+        self._damaged = []
+        self._dir = os.fspath(directory)
         self._closed = False
         os.makedirs(self._dir, exist_ok=True)
         self._lock_file = open(os.path.join(self._dir, _LOCK_NAME), "a+b")
@@ -659,6 +714,11 @@ class RetainedJournal:
                 raise Corruption("manifest is not valid JSON") from exc
             if not isinstance(manifest, dict) or manifest.get("version") != _MANIFEST_VERSION:
                 raise Corruption("unsupported manifest version")
+
+        # Settle any interrupted repair before anything else becomes visible.
+        # A committed decision forces the whole batch forward; its absence
+        # restores the pre-repair state by discarding staged copies.
+        self._resolve_repair()
 
         self._cleanup_stale(manifest)
 
@@ -693,6 +753,11 @@ class RetainedJournal:
 
         self.recovered_bytes = 0
         self._offsets = []
+        # Body lengths and original body CRCs of every scanned frame, parallel
+        # to ``_offsets``; repair needs the original header to validate bodies.
+        self._offset_sizes = []
+        self._offset_crcs = []
+        self._damaged = []
         self._end = self._floor
         self._scan()
         self._seg_file = None
@@ -719,6 +784,98 @@ class RetainedJournal:
                 raise Corruption(f"unexpected directory entry: {name}")
             os.unlink(path)
         self._fsync_dir()
+
+    # -- repair recovery ---------------------------------------------------
+
+    def _resolve_repair(self):
+        """Settle an interrupted repair batch before the journal is exposed.
+
+        ``repair.commit`` is the durable point of no return.  With it present
+        the batch is complete; both markers are dropped.  Without it, a dangling
+        ``repair.intent`` means the batch never committed: every recorded
+        original body is written back, the intent dropped, restoring the exact
+        pre-repair bytes.  The manifest is never modified, so offsets,
+        consumers and the append segment are untouched in both outcomes.
+        """
+        commit_path = os.path.join(self._dir, _REPAIR_COMMIT_NAME)
+        intent_path = os.path.join(self._dir, _REPAIR_INTENT_NAME)
+        if os.path.exists(commit_path):
+            self._unlink(_REPAIR_INTENT_NAME)
+            self._unlink(_REPAIR_COMMIT_NAME)
+            self._fsync_dir()
+            return
+        try:
+            with open(intent_path, "rb") as handle:
+                raw = handle.read()
+        except FileNotFoundError:
+            return
+        self._rollback_intent(raw)
+        self._unlink(_REPAIR_INTENT_NAME)
+        self._fsync_dir()
+
+    def _parse_intent(self, raw):
+        """Return a list of (seg_name, [(physical, original_body), ...])."""
+        if not raw.startswith(_REPAIR_INTENT_MAGIC):
+            raise Corruption("invalid repair intent header")
+        pos = len(_REPAIR_INTENT_MAGIC)
+        if len(raw) < pos + _REPAIR_COUNT.size:
+            raise Corruption("truncated repair intent")
+        groups = _REPAIR_COUNT.unpack_from(raw, pos)[0]
+        pos += _REPAIR_COUNT.size
+        if groups > _REPAIR_MAX_ITEMS:
+            raise Corruption("repair intent exceeds limits")
+        result = []
+        total = 0
+        for _ in range(groups):
+            if len(raw) < pos + _REPAIR_NAME_COUNTS.size:
+                raise Corruption("truncated repair intent")
+            name_len, count = _REPAIR_NAME_COUNTS.unpack_from(raw, pos)
+            pos += _REPAIR_NAME_COUNTS.size
+            if count > _REPAIR_MAX_ITEMS:
+                raise Corruption("repair intent exceeds limits")
+            if len(raw) < pos + name_len:
+                raise Corruption("truncated repair intent")
+            try:
+                seg_name = raw[pos:pos + name_len].decode("ascii")
+            except UnicodeDecodeError as exc:
+                raise Corruption("invalid repair intent segment name") from exc
+            pos += name_len
+            if not _SEG_RE.fullmatch(seg_name):
+                raise Corruption("invalid repair intent segment name")
+            entries = []
+            for _ in range(count):
+                if len(raw) < pos + _REPAIR_ENTRY.size:
+                    raise Corruption("truncated repair intent entry")
+                physical, length, _reserved = _REPAIR_ENTRY.unpack_from(raw, pos)
+                pos += _REPAIR_ENTRY.size
+                if len(raw) < pos + length:
+                    raise Corruption("truncated repair intent body")
+                entries.append((physical, raw[pos:pos + length]))
+                total += length
+                pos += length
+            result.append((seg_name, entries))
+        if total > _REPAIR_MAX_BYTES:
+            raise Corruption("repair intent exceeds byte limit")
+        if pos != len(raw):
+            raise Corruption("trailing bytes in repair intent")
+        return result
+
+    def _rollback_intent(self, raw):
+        groups = self._parse_intent(raw)
+        for seg_name, entries in groups:
+            path = os.path.join(self._dir, seg_name)
+            try:
+                handle = open(path, "r+b")
+            except FileNotFoundError as exc:
+                raise Corruption(f"missing segment {seg_name}") from exc
+            with handle:
+                for physical, body in entries:
+                    handle.seek(physical)
+                    handle.write(body)
+                handle.flush()
+                os.fsync(handle.fileno())
+
+
 
     def _scan(self):
         last = len(self._segments) - 1
@@ -760,11 +917,20 @@ class RetainedJournal:
                         self._truncate_tail(handle, physical, logical)
                         break
                     # A complete frame with a bad checksum is corruption and
-                    # must never be silently treated as a torn tail.
+                    # must never be silently treated as a torn tail.  In repair
+                    # mode an intact header still tells us exactly where the
+                    # next frame begins, so the frame keeps its length and
+                    # quota and is recorded for later repair.
                     if crc32(data) != body_crc:
-                        raise Corruption(
-                            f"payload checksum mismatch at byte {logical}"
-                        )
+                        if not (
+                            self._repair_mode and index != last
+                        ):
+                            raise Corruption(
+                                f"payload checksum mismatch at byte {logical}"
+                            )
+                        self._damaged.append(logical)
+                    self._offset_sizes.append(size)
+                    self._offset_crcs.append(body_crc)
                     self._offsets.append(logical)
                     frame_len = _HEADER.size + size
                     physical += frame_len
@@ -891,6 +1057,8 @@ class RetainedJournal:
             self._closed = True
             raise
         self._offsets.append(start)
+        self._offset_sizes.append(len(data))
+        self._offset_crcs.append(crc32(data))
         self._end += frame_len
         return start
 
@@ -929,6 +1097,16 @@ class RetainedJournal:
         index = bisect_left(self._offsets, offset)
         if index == len(self._offsets) or self._offsets[index] != offset:
             raise ValueError("offset is not a frame boundary")
+
+        # In repair mode a read that would include a damaged frame returns
+        # nothing but raises ``DamagedFrame`` naming the first one touched; a
+        # read that stays entirely on healthy frames behaves normally.
+        if self._damaged:
+            stop = min(index + limit, len(self._offsets))
+            range_end = self._offsets[stop] if stop < len(self._offsets) else self._end
+            hit = bisect_left(self._damaged, offset)
+            if hit < len(self._damaged) and self._damaged[hit] < range_end:
+                raise DamagedFrame(self._damaged[hit])
 
         rows = []
         starts = self._segment_starts()
@@ -1030,6 +1208,230 @@ class RetainedJournal:
                 "consumer name must be 1-32 ASCII letters, digits, _ or -"
             )
 
+    # -- repair ------------------------------------------------------------
+
+    def damaged(self):
+        """Frame starts of complete sealed frames whose body CRC is currently
+        bad, ascending.  Always empty in strict mode."""
+        self._require_open()
+        return tuple(self._damaged)
+
+    def repair(self, replacements):
+        """Replace the bodies of one or more damaged sealed frames atomically.
+
+        ``replacements`` is a list/tuple of up to 8 ``(offset, data)`` pairs:
+        each ``offset`` a distinct sealed frame start still retained, each
+        ``data`` the correct body bytes (``bytes``) of exactly the original
+        length whose CRC matches the stored frame header.  A healthy frame may
+        appear only as a byte-identical retry.  The whole batch is validated
+        before anything changes; any invalid, expired, non-sealed, or
+        wrong-body entry raises ``ValueError`` without touching any frame,
+        acknowledgement, or repair state.
+
+        Returns the number of frames actually corrected (0 for a batch of
+        byte-identical retries).  Frames, headers, offsets, ``floor``,
+        ``end``, consumers and the append segment are otherwise unchanged, so
+        an ordinary strict-mode reader observes the corrected AJ1 bytes at the
+        original cursors.  Only available in repair mode.
+        """
+        self._require_open()
+        if not self._repair_mode:
+            raise ValueError("repair is only available in repair mode")
+        if not isinstance(replacements, (list, tuple)):
+            raise ValueError("replacements must be a list or tuple")
+        if not 1 <= len(replacements) <= _REPAIR_MAX_ITEMS:
+            raise ValueError(
+                f"replacements must contain 1-{_REPAIR_MAX_ITEMS} items"
+            )
+
+        items = []
+        seen = set()
+        total = 0
+        for entry in replacements:
+            if not isinstance(entry, (list, tuple)) or len(entry) != 2:
+                raise ValueError("each replacement must be an (offset, data) pair")
+            offset, data = entry
+            if type(offset) is not int:
+                raise ValueError("replacement offset must be an integer")
+            if not isinstance(data, bytes):
+                raise ValueError("replacement data must be bytes")
+            if offset in seen:
+                raise ValueError("replacement offsets must be distinct")
+            seen.add(offset)
+            if offset < self._floor or offset not in self._offsets:
+                raise ValueError("replacement offset is not a retained frame")
+            index = bisect_left(self._offsets, offset)
+            if not self._is_sealed(index):
+                raise ValueError("replacement offset is not in a sealed segment")
+            size = self._offset_sizes[index]
+            original_crc = self._offset_crcs[index]
+            if len(data) != size:
+                raise ValueError("replacement body length does not match frame")
+            if offset not in self._damaged:
+                # A healthy frame tolerates only an exact byte-identical retry.
+                if crc32(data) != original_crc:
+                    raise ValueError("replacement body is not a matching retry")
+                if data != self._read_body(index):
+                    raise ValueError("replacement for healthy frame differs")
+                items.append((index, offset, data, False))
+            else:
+                if crc32(data) != original_crc:
+                    raise ValueError("replacement body CRC does not match header")
+                items.append((index, offset, data, True))
+            total += len(data)
+
+        if total > _REPAIR_MAX_BYTES:
+            raise ValueError("replacement bodies exceed the 2 MiB batch limit")
+
+        actual = [item for item in items if item[3]]
+        if not actual:
+            return 0
+
+        # Group the actual replacements by the sealed segment holding them and
+        # compute each frame's physical body location inside its segment.
+        starts = self._segment_starts()
+        groups = {}
+        for index, offset, data, _changed in actual:
+            seg_index = bisect_right(starts, offset) - 1
+            physical = len(MAGIC) + (offset - starts[seg_index]) + _HEADER.size
+            groups.setdefault(seg_index, []).append((physical, data))
+        seg_order = sorted(groups)
+
+        # Build the undo log: each changed frame's current (still corrupted)
+        # body bytes and its exact physical location.
+        intent_groups = []
+        for seg_index in seg_order:
+            seg_name = self._segment_name(seg_index)
+            entries = [
+                (physical, self._read_physical(seg_name, physical, len(data)))
+                for physical, data in groups[seg_index]
+            ]
+            intent_groups.append((seg_name, entries))
+
+        # Durable intent before touching any target byte.  Its presence without
+        # a commit marker lets a reopen restore the exact pre-repair bytes.
+        self._write_intent(intent_groups)
+
+        try:
+            multi = len(seg_order) >= 2
+            for position, seg_index in enumerate(seg_order):
+                seg_name = self._segment_name(seg_index)
+                self._apply_bodies(seg_name, groups[seg_index])
+                if multi and position == 0:
+                    # The first segment's corrected bodies are in place and no
+                    # later segment's correction has been applied yet.
+                    self._invoke_repair_hook("after_first_materialized")
+
+            # Every corrected body is durable; publish the commit marker.  Its
+            # atomic rename is the durable point of no return.
+            self._write_commit()
+        except BaseException:
+            # A callback or I/O error before commit: restore the original
+            # bodies and drop the markers, leaving this handle closed.
+            try:
+                self._rollback_from(intent_groups)
+                self._unlink(_REPAIR_INTENT_NAME)
+                self._unlink(_REPAIR_INTENT_NAME + _TMP_SUFFIX)
+                self._fsync_dir()
+            finally:
+                self._closed = True
+            raise
+
+        # The decision is durable and before we return we report it; a kill in
+        # this callback reopens onto the commit marker and keeps the new bytes.
+        try:
+            self._invoke_repair_hook("after_repair_commit")
+        finally:
+            # Batch is final.  Drop the undo log, then the commit marker; an
+            # interruption in between still leaves the commit marker meaning
+            # "new state".  Afterwards a reopen reads the corrected bytes with
+            # no markers to resolve.
+            self._unlink(_REPAIR_INTENT_NAME)
+            self._unlink(_REPAIR_COMMIT_NAME)
+            self._fsync_dir()
+
+            # Reflect the new bodies in memory: corrected frames are healthy.
+            for index, offset, data, _changed in actual:
+                self._offset_crcs[index] = crc32(data)
+            fixed = {offset for _i, offset, _d, _c in actual}
+            self._damaged = [off for off in self._damaged if off not in fixed]
+        return len(actual)
+
+    def _read_physical(self, seg_name, physical, length):
+        with open(os.path.join(self._dir, seg_name), "rb") as handle:
+            handle.seek(physical)
+            data = handle.read(length)
+        if len(data) != length:
+            raise Corruption("segment ended before repair target")
+        return data
+
+    def _apply_bodies(self, seg_name, patches):
+        with open(os.path.join(self._dir, seg_name), "r+b") as handle:
+            for physical, data in patches:
+                handle.seek(physical)
+                handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+        self._fsync_dir()
+
+    def _rollback_from(self, intent_groups):
+        for seg_name, entries in intent_groups:
+            with open(os.path.join(self._dir, seg_name), "r+b") as handle:
+                for physical, body in entries:
+                    handle.seek(physical)
+                    handle.write(body)
+                handle.flush()
+                os.fsync(handle.fileno())
+        self._fsync_dir()
+
+    def _write_intent(self, intent_groups):
+        buf = bytearray(_REPAIR_INTENT_MAGIC)
+        buf += _REPAIR_COUNT.pack(len(intent_groups))
+        for seg_name, entries in intent_groups:
+            name = seg_name.encode("ascii")
+            buf += _REPAIR_NAME_COUNTS.pack(len(name), len(entries))
+            buf += name
+            for physical, body in entries:
+                buf += _REPAIR_ENTRY.pack(physical, len(body), 0)
+                buf += body
+        self._write_marker(_REPAIR_INTENT_NAME, bytes(buf))
+
+    def _write_commit(self):
+        self._write_marker(_REPAIR_COMMIT_NAME, _REPAIR_COMMIT_MAGIC)
+
+    def _write_marker(self, name, payload):
+        tmp_path = os.path.join(self._dir, name + _TMP_SUFFIX)
+        with open(tmp_path, "wb") as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.rename(tmp_path, os.path.join(self._dir, name))
+        self._fsync_dir()
+
+
+    def _is_sealed(self, index):
+        """A frame is sealed when it lives in a segment other than the current
+        append segment (frames never straddle a segment)."""
+        if not self._segments:
+            return False
+        offset = self._offsets[index]
+        starts = self._segment_starts()
+        seg_index = bisect_right(starts, offset) - 1
+        return seg_index < len(self._segments) - 1
+
+    def _read_body(self, index):
+        offset = self._offsets[index]
+        starts = self._segment_starts()
+        seg_index = bisect_right(starts, offset) - 1
+        physical = len(MAGIC) + (offset - starts[seg_index])
+        with open(os.path.join(self._dir, self._segment_name(seg_index)), "rb") as h:
+            h.seek(physical + _HEADER.size)
+            return h.read(self._offset_sizes[index])
+
+    def _invoke_repair_hook(self, phase):
+        if self._repair_hook is not None:
+            self._repair_hook(phase)
+
     # -- pruning -----------------------------------------------------------
 
     def prune(self):
@@ -1038,6 +1440,11 @@ class RetainedJournal:
             new_floor = min(self._consumers.values())
         else:
             new_floor = self._floor
+        # A damaged frame is live evidence: even when consumers have confirmed
+        # past it, reclamation stops at the earliest one so it can still be
+        # repaired.  Healthy bytes before it may be released as usual.
+        if self._damaged:
+            new_floor = min(new_floor, self._damaged[0])
         return self._prune_to(new_floor)
 
     def _prune_to(self, new_floor):
@@ -1124,6 +1531,8 @@ class RetainedJournal:
             published = True
             cut = bisect_left(self._offsets, new_floor)
             del self._offsets[:cut]
+            del self._offset_sizes[:cut]
+            del self._offset_crcs[:cut]
             if self._segments:
                 self._seg_file = open(
                     os.path.join(

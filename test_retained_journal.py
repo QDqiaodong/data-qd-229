@@ -1,6 +1,7 @@
 """Tests for RetainedJournal: cursor-driven physical reclamation."""
 import json
 import os
+from bisect import bisect_right
 from pathlib import Path
 import subprocess
 import sys
@@ -10,6 +11,7 @@ import unittest
 from journal import (
     MAGIC,
     Corruption,
+    DamagedFrame,
     ExpiredOffset,
     MAX_RECORD,
     RetainedJournal,
@@ -46,6 +48,33 @@ def read_all(journal, limit=256):
 
 def boundaries(rows):
     return [r.offset for r in rows]
+
+
+def segment_layout(directory):
+    """Return manifest segment entries as (name, logical_start) pairs."""
+    manifest = json.loads((Path(directory) / "manifest.json").read_text())
+    return [(str(e[0]), int(e[1])) for e in manifest["segments"]]
+
+
+def segment_of(directory, offset):
+    """Return (name, logical_start) of the segment holding ``offset``."""
+    layout = segment_layout(directory)
+    starts = [start for _name, start in layout]
+    index = bisect_right(starts, offset) - 1
+    return layout[index]
+
+
+def corrupt_body(directory, offset):
+    """Flip one byte inside a frame body without touching the frame header.
+
+    Returns the segment path so the caller can restore it if needed."""
+    seg_name, seg_start = segment_of(directory, offset)
+    path = Path(directory) / seg_name
+    raw = bytearray(path.read_bytes())
+    physical = len(MAGIC) + (offset - seg_start) + _HEADER.size
+    raw[physical] ^= 0xFF
+    path.write_bytes(bytes(raw))
+    return path
 
 
 class BasicBehaviourTest(unittest.TestCase):
@@ -424,6 +453,63 @@ class _BigLogMixin:
             return offsets
 
 
+# --- crash-during-repair test support -------------------------------------
+
+REPAIR_CHILD_SCRIPT = r"""
+import os, sys
+sys.path.insert(0, os.environ["PROJECT_DIR"])
+from journal import RetainedJournal
+
+directory, phase, plan_path, stats = sys.argv[1:5]
+
+def wchar():
+    with open("/proc/self/io") as h:
+        for line in h:
+            if line.startswith("wchar:"):
+                return int(line.split()[1])
+    return -1
+
+start_wchar = wchar()
+
+# Plan file: "<off_a> <len_a>\n<off_b> <len_b>\n<body_a_hex>\n<body_b_hex>\n"
+with open(plan_path) as f:
+    off_a, len_a = (int(x) for x in f.readline().split())
+    off_b, len_b = (int(x) for x in f.readline().split())
+    body_a = bytes.fromhex(f.readline().strip())
+    body_b = bytes.fromhex(f.readline().strip())
+assert len(body_a) == len_a and len(body_b) == len_b
+
+def hook(observed):
+    if observed == phase:
+        # Record this process's cumulative write-char delta, then really end
+        # it.  This is not a journal operation; it only observes the budget.
+        with open(stats, "w") as h:
+            h.write(str(wchar() - start_wchar))
+        os.kill(os.getpid(), 9)
+
+with RetainedJournal(directory, repair_mode=True, repair_hook=hook) as log:
+    log.repair([(off_a, body_a), (off_b, body_b)])
+"""
+
+
+def wchar():
+    """Linux /proc/self/io cumulative write char count."""
+    with open("/proc/self/io", "r") as handle:
+        for line in handle:
+            if line.startswith("wchar:"):
+                return int(line.split()[1])
+    raise RuntimeError("wchar not found")
+
+
+def no_repair_leftovers(directory):
+    return not any(
+        p.name == "repair.intent"
+        or p.name == "repair.commit"
+        or p.name.startswith("repair.")
+        for p in Path(directory).iterdir()
+    )
+
+
 class SpaceAndCrashTest(unittest.TestCase, _BigLogMixin):
     def setUp(self):
         self.root = TemporaryDirectory()
@@ -560,6 +646,413 @@ class SpaceAndCrashTest(unittest.TestCase, _BigLogMixin):
             self.assertEqual([r.data for r in read_all(log)], [b"again"])
         self.assertFalse(list(Path(self.dir).glob("*.tmp")))
         self.assertLessEqual(tree_size(self.dir), 192 * 1024)
+
+
+# --- large-log repair crash and space tests -------------------------------
+
+class RepairCrashTest(unittest.TestCase):
+    """Real process kills at each repair callback, plus write/space budgets.
+
+    Builds a >30 MiB log, corrupts one body in each of two sealed segments
+    (leaving healthy neighbours in both), and independently kills a child at
+    ``after_first_materialized`` and ``after_repair_commit``.
+    """
+
+    PAYLOAD = 64 * 1024
+    N_FRAMES = 560  # ~560 * 64 KiB ~= 35 MiB, many 256 KiB segments
+    DELTA = 3 * 1024 * 1024  # documented slack
+
+    def setUp(self):
+        self.root = TemporaryDirectory()
+        self.addCleanup(self.root.cleanup)
+        self.dir = Path(self.root.name) / "journal"
+        self.script = Path(self.root.name) / "repair_child.py"
+        self.script.write_text(REPAIR_CHILD_SCRIPT)
+        self.stats = Path(self.root.name) / "stats.txt"
+
+    def _build(self):
+        with RetainedJournal(self.dir) as log:
+            offsets = [
+                log.append(bytes([i % 256]) * self.PAYLOAD)
+                for i in range(self.N_FRAMES)
+            ]
+            log.register("c")
+            log.ack("c", log.end)
+            end = log.end
+        self.assertGreater(end - 4, 30 * 1024 * 1024)
+        return offsets, end
+
+    def _pick_damage(self, offsets):
+        """Choose one frame in each of two *distinct sealed* segments, each
+        with a healthy neighbour in the same segment."""
+        layout = segment_layout(self.dir)
+        starts = [start for _name, start in layout]
+        last = len(layout) - 1
+
+        def seg_of(offset):
+            return bisect_right(starts, offset) - 1
+
+        by_seg = {}
+        for index, offset in enumerate(offsets):
+            by_seg.setdefault(seg_of(offset), []).append(index)
+        # Sealed segments with at least two frames so a neighbour is healthy.
+        candidates = [
+            seg for seg in sorted(by_seg)
+            if seg != last and len(by_seg[seg]) >= 2
+        ]
+        pick = candidates[1], candidates[-2]  # two well-separated segments
+        chosen = []
+        for seg in pick:
+            members = by_seg[seg]
+            # Damage a non-first frame; its segment-mates stay healthy.
+            chosen.append(members[1])
+        return chosen
+
+    def _corrupt(self, offset):
+        corrupt_body(self.dir, offset)
+
+    def _run_child(self, phase, a, body_a, b, body_b):
+        plan = Path(self.root.name) / "plan.txt"
+        plan.write_text(
+            f"{a} {len(body_a)}\n{b} {len(body_b)}\n"
+            f"{body_a.hex()}\n{body_b.hex()}\n"
+        )
+        env = dict(os.environ, PROJECT_DIR=PROJECT_DIR)
+        proc = subprocess.run(
+            [
+                sys.executable, str(self.script), str(self.dir), phase,
+                str(plan), str(self.stats),
+            ],
+            env=env, capture_output=True, text=True,
+        )
+        self.assertEqual(proc.returncode, -9, proc.stderr)
+
+    def _expected_body(self, offsets, index):
+        return bytes([index % 256]) * self.PAYLOAD
+
+    def _setup_damaged(self):
+        offsets, end = self._build()
+        idx_a, idx_b = self._pick_damage(offsets)
+        a, b = offsets[idx_a], offsets[idx_b]
+        body_a = self._expected_body(offsets, idx_a)
+        body_b = self._expected_body(offsets, idx_b)
+        self._corrupt(a)
+        self._corrupt(b)
+        # Confirm the chosen frames are the only damage and are sealed.
+        with RetainedJournal(self.dir, repair_mode=True) as log:
+            self.assertEqual(log.damaged(), (a, b))
+            self.assertEqual(log.checkpoint("c"), end)
+        return offsets, end, idx_a, idx_b, a, b, body_a, body_b
+
+    def _read_strict(self, offsets, indices, end):
+        with RetainedJournal(self.dir) as log:
+            self.assertEqual(log.checkpoint("c"), end)
+            rows = log.read(4, limit=len(offsets) + 1)
+            self.assertEqual(boundaries(rows), offsets)
+            for i in indices:
+                self.assertEqual(rows[i].data, self._expected_body(offsets, i))
+            return log
+
+    def test_kill_at_after_repair_commit_is_new_state(self):
+        offsets, end, ia, ib, a, b, ba, bb = self._setup_damaged()
+        self._run_child("after_repair_commit", a, ba, b, bb)
+        child_writes = int(self.stats.read_text())
+        # New state: strict mode opens, the whole batch is present, no resend.
+        before = wchar()
+        with RetainedJournal(self.dir) as log:
+            self.assertEqual(log.checkpoint("c"), end)
+            self.assertEqual(log.floor, 4)
+            rows = log.read(4, limit=len(offsets) + 1)
+            self.assertEqual(boundaries(rows), offsets)
+            self.assertEqual(rows[ia].data, ba)
+            self.assertEqual(rows[ib].data, bb)
+            # Healthy neighbours in the same segments are undisturbed.
+            self.assertEqual(rows[ia - 1].data, self._expected_body(offsets, ia - 1))
+            self.assertEqual(rows[ib + 1].data, self._expected_body(offsets, ib + 1))
+        reopen_writes = wchar() - before
+        self.assertTrue(no_repair_leftovers(self.dir))
+        # Budget: child (to the kill point) + one reopen <= 2T + 3 MiB.
+        T = len(ba) + len(bb)
+        self.assertLessEqual(child_writes + reopen_writes, 2 * T + self.DELTA)
+
+    def test_kill_at_after_first_materialized_rolls_back_then_resend(self):
+        offsets, end, ia, ib, a, b, ba, bb = self._setup_damaged()
+        self._run_child("after_first_materialized", a, ba, b, bb)
+        child_writes = int(self.stats.read_text())
+        # No durable commit -> old state: strict mode must still refuse.
+        with self.assertRaises(Corruption):
+            RetainedJournal(self.dir)
+        # Measure only the reopen disposition (rollback to the pre-repair
+        # bodies), which the budget counts alongside the child's own writes.
+        before = wchar()
+        with RetainedJournal(self.dir, repair_mode=True) as log:
+            self.assertEqual(log.damaged(), (a, b))
+            self.assertEqual(log.checkpoint("c"), end)
+            self.assertEqual(log.floor, 4)
+        reopen_writes = wchar() - before
+        self.assertTrue(no_repair_leftovers(self.dir))
+        T = len(ba) + len(bb)
+        # Child (to the kill point) + one reopen disposition <= 2T + 3 MiB.
+        self.assertLessEqual(child_writes + reopen_writes, 2 * T + self.DELTA)
+        self.assertLessEqual(tree_size(self.dir), end - 4 + self.DELTA)
+        # Now resend the same batch on the restored old state: it must repair.
+        with RetainedJournal(self.dir, repair_mode=True) as log:
+            self.assertEqual(log.repair([(a, ba), (b, bb)]), 2)
+            self.assertEqual(log.damaged(), ())
+        self.assertTrue(no_repair_leftovers(self.dir))
+        self._read_strict(offsets, (ia, ib), end)
+
+    def test_directory_growth_and_no_copies(self):
+        offsets, end, ia, ib, a, b, ba, bb = self._setup_damaged()
+        start_size = tree_size(self.dir)
+        observed = {}
+
+        def hook(phase):
+            observed[phase] = tree_size(self.dir) - start_size
+
+        with RetainedJournal(self.dir, repair_mode=True,
+                             repair_hook=hook) as log:
+            self.assertEqual(log.repair([(a, ba), (b, bb)]), 2)
+        T = len(ba) + len(bb)
+        # Extra bytes under the directory never exceed T + 3 MiB at any point.
+        for phase, growth in observed.items():
+            self.assertLessEqual(growth, T + self.DELTA)
+        # No staged segment copies remain after a successful repair.
+        self.assertFalse(list(Path(self.dir).glob("repair-*.aj")))
+        self.assertTrue(no_repair_leftovers(self.dir))
+
+
+class DamagedRepairTest(unittest.TestCase):
+    """Offline body corruption in sealed segments, repaired in repair mode."""
+
+    # Large enough that the log spans several 256 KiB segments, so the frames
+    # we corrupt sit in sealed (non-append) segments.
+    PAYLOAD = 70000
+
+    def setUp(self):
+        self.root = TemporaryDirectory()
+        self.addCleanup(self.root.cleanup)
+        self.dir = Path(self.root.name) / "journal"
+
+    def _build(self, n=20):
+        with RetainedJournal(self.dir) as log:
+            offsets = [
+                log.append(bytes([i % 256]) * self.PAYLOAD) for i in range(n)
+            ]
+            log.register("c")
+            log.ack("c", log.end)
+            end = log.end
+            seg_count = len(segment_layout(self.dir))
+        self.assertGreater(seg_count, 2)
+        return offsets, end
+
+    def test_damage_detection_read_and_prune(self):
+        offsets, end = self._build()
+        target = offsets[3]
+        corrupt_body(self.dir, target)
+        # Strict mode refuses to open an unrepaired log.
+        with self.assertRaises(Corruption):
+            RetainedJournal(self.dir)
+        with RetainedJournal(self.dir, repair_mode=True) as log:
+            self.assertEqual(log.damaged(), (target,))
+            # floor, end and ack are unchanged by the scan.
+            self.assertEqual(log.floor, 4)
+            self.assertEqual(log.end, end)
+            self.assertEqual(log.checkpoint("c"), end)
+            # Reading a batch that touches the bad frame raises DamagedFrame
+            # naming the first touched damaged frame, yielding no rows.
+            with self.assertRaises(DamagedFrame) as ctx:
+                log.read(offsets[1], limit=5)
+            self.assertEqual(ctx.exception.offset, target)
+            self.assertIsInstance(ctx.exception, Corruption)
+            # A read entirely on healthy frames below the damage still works.
+            rows = log.read(offsets[0], limit=3)
+            self.assertEqual(boundaries(rows), offsets[:3])
+            # A read starting from a known healthy later offset also works.
+            rows = log.read(offsets[4], limit=3)
+            self.assertEqual(boundaries(rows), offsets[4:7])
+            # Append continues at the original end and keeps the frame quota.
+            new = log.append(b"after")
+            self.assertEqual(new, end)
+            # Consumers acked to the end; prune may only cut up to the damage.
+            self.assertEqual(log.prune(), target)
+            self.assertEqual(log.floor, target)
+            # The bad frame is still retained and still reported.
+            self.assertEqual(log.damaged(), (target,))
+            self.assertEqual(log.end, new + _HEADER.size + 5)
+
+    def test_batch_rejected_atomically_then_repaired(self):
+        offsets, end = self._build()
+        bad_a, bad_b = offsets[2], offsets[6]
+        corrupt_body(self.dir, bad_a)
+        corrupt_body(self.dir, bad_b)
+        with RetainedJournal(self.dir, repair_mode=True) as log:
+            self.assertEqual(log.damaged(), (bad_a, bad_b))
+            good_a = bytes([2]) * self.PAYLOAD
+            good_b = bytes([6]) * self.PAYLOAD
+            wrong_b = bytes([7]) * self.PAYLOAD
+            # One correct item and one wrong-body item: the whole batch fails
+            # and nothing changes.
+            with self.assertRaises(ValueError):
+                log.repair([(bad_a, good_a), (bad_b, wrong_b)])
+            self.assertEqual(log.damaged(), (bad_a, bad_b))
+            self.assertEqual(log.floor, 4)
+            self.assertEqual(log.checkpoint("c"), end)
+            # A good batch repairs both; every frame keeps its original offset.
+            n = log.repair([(bad_a, good_a), (bad_b, good_b)])
+            self.assertEqual(n, 2)
+            self.assertEqual(log.damaged(), ())
+            self.assertEqual(log.checkpoint("c"), end)
+            self.assertEqual(log.floor, 4)
+            # Repeating the same batch is an idempotent no-op.
+            self.assertEqual(log.repair([(bad_a, good_a), (bad_b, good_b)]), 0)
+            # In repair mode the corrected bodies read back at old cursors.
+            rows = log.read(4, limit=100)
+            self.assertEqual(boundaries(rows), offsets)
+            self.assertEqual(rows[2].data, good_a)
+            self.assertEqual(rows[6].data, good_b)
+            # A real prune now releases to the consumer ack at end.
+            self.assertEqual(log.prune(), end)
+            self.assertEqual(log.floor, end)
+            with self.assertRaises(ExpiredOffset):
+                log.read(offsets[0])
+        # A strict reopen after the full prune is an empty, healthy log.
+        with RetainedJournal(self.dir) as log:
+            self.assertEqual(log.floor, end)
+            self.assertEqual(log.read(), [])
+
+    def test_strict_reads_repaired_bodies_at_original_cursor(self):
+        offsets, _end = self._build()
+        bad = offsets[5]
+        corrupt_body(self.dir, bad)
+        with RetainedJournal(self.dir, repair_mode=True) as log:
+            self.assertEqual(log.repair([(bad, bytes([5]) * self.PAYLOAD)]), 1)
+        # Strict mode reads the genuine corrected AJ1 frame at the same cursor.
+        with RetainedJournal(self.dir) as log:
+            rows = log.read(offsets[3], limit=4)
+            self.assertEqual(boundaries(rows), offsets[3:7])
+            self.assertEqual(rows[2].offset, bad)
+            self.assertEqual(rows[2].data, bytes([5]) * self.PAYLOAD)
+            # The healthy suffix beyond the repair is unchanged.
+            tail = log.read(offsets[7], limit=100)
+            self.assertEqual(boundaries(tail), offsets[7:])
+            for index in range(7, len(offsets)):
+                self.assertEqual(
+                    tail[index - 7].data,
+                    bytes([index % 256]) * self.PAYLOAD,
+                )
+
+    def test_prune_stops_at_damage_then_advances_after_repair(self):
+        offsets, _end = self._build()
+        bad = offsets[4]
+        corrupt_body(self.dir, bad)
+        with RetainedJournal(self.dir, repair_mode=True) as log:
+            self.assertEqual(log.prune(), bad)
+            self.assertEqual(log.floor, bad)
+            self.assertEqual(log.repair([(bad, bytes([4]) * self.PAYLOAD)]), 1)
+            # Repair does not advance floor or acks by itself.
+            self.assertEqual(log.floor, bad)
+            self.assertEqual(log.checkpoint("c"), log.end)
+            # Next prune recomputes the real cut point from the consumer.
+            self.assertEqual(log.prune(), log.end)
+            self.assertEqual(log.floor, log.end)
+
+    def test_prune_takes_min_of_ack_and_damage(self):
+        offsets, _end = self._build()
+        bad = offsets[5]
+        corrupt_body(self.dir, bad)
+        with RetainedJournal(self.dir, repair_mode=True) as log:
+            # A second, lagging consumer pins reclamation below the damage.
+            log.register("slow")
+            log.ack("slow", offsets[2])
+            self.assertEqual(log.checkpoint("c"), log.end)
+            self.assertEqual(log.prune(), offsets[2])
+            self.assertEqual(log.floor, offsets[2])
+            # Advancing the lagging consumer past the damage is still capped.
+            log.ack("slow", offsets[8])
+            self.assertEqual(log.prune(), bad)
+            self.assertEqual(log.floor, bad)
+            self.assertEqual(log.damaged(), (bad,))
+
+    def test_old_cursor_and_healthy_suffix_reads(self):
+        offsets, end = self._build()
+        bad = offsets[3]
+        corrupt_body(self.dir, bad)
+        with RetainedJournal(self.dir, repair_mode=True) as log:
+            # Reading at the damaged offset itself touches it.
+            with self.assertRaises(DamagedFrame):
+                log.read(bad)
+            # Healthy suffix with default limit reaching only good frames.
+            rows = log.read(offsets[4], limit=2)
+            self.assertEqual(boundaries(rows), offsets[4:6])
+            # Unknown / frame-internal offsets still raise plain ValueError.
+            with self.assertRaises(ValueError):
+                log.read(bad + 1)
+            self.assertEqual(log.repair([(bad, bytes([3]) * self.PAYLOAD)]), 1)
+        # strict reopen: same cursors, repaired body, healthy suffix intact.
+        with RetainedJournal(self.dir) as log:
+            rows = log.read(4, limit=100)
+            self.assertEqual(boundaries(rows), offsets)
+            self.assertEqual(rows[3].data, bytes([3]) * self.PAYLOAD)
+            self.assertEqual(rows[5].data, bytes([5]) * self.PAYLOAD)
+
+    def test_unrepairable_header_corruption_still_fails(self):
+        offsets, _end = self._build()
+        seg_name, seg_start = segment_of(self.dir, offsets[3])
+        path = Path(self.dir) / seg_name
+        raw = bytearray(path.read_bytes())
+        physical = len(MAGIC) + (offsets[3] - seg_start)
+        raw[physical] ^= 0xFF  # inside the frame header
+        path.write_bytes(bytes(raw))
+        for mode in (False, True):
+            with self.subTest(repair_mode=mode):
+                with self.assertRaises(Corruption):
+                    RetainedJournal(self.dir, repair_mode=mode)
+
+    def test_repair_only_in_repair_mode(self):
+        offsets, _end = self._build()
+        with RetainedJournal(self.dir) as log:
+            with self.assertRaises(ValueError):
+                log.repair([(offsets[0], b"x")])
+            self.assertEqual(log.damaged(), ())
+
+    def test_repair_input_validation(self):
+        offsets, _end = self._build()
+        bad = offsets[3]
+        corrupt_body(self.dir, bad)
+        with RetainedJournal(self.dir, repair_mode=True) as log:
+            end = log.end
+            good_body = bytes([3]) * self.PAYLOAD
+            bad_inputs = [
+                [],  # empty
+                [(bad, good_body)] * 9,  # >8 items
+                [(bad, bytearray(good_body))],  # not bytes
+                [(bad, good_body[:-1])],  # wrong length
+                [(bad + 1, good_body)],  # not a frame boundary
+                [(end, b"")],  # end is not a retained sealed frame
+                [(offsets[0], b"z" * self.PAYLOAD)],  # healthy frame, different body
+                [(bad, good_body), (bad, good_body)],  # duplicate
+                [(bad, b"x" * (2 * 1024 * 1024 + 1))],  # length mismatch anyway
+            ]
+            for bad_input in bad_inputs:
+                with self.subTest(bad_input=str(bad_input)[:40]):
+                    with self.assertRaises(ValueError):
+                        log.repair(bad_input)
+            # Nothing changed after all rejected batches.
+            self.assertEqual(log.damaged(), (bad,))
+            self.assertEqual(log.floor, 4)
+            self.assertEqual(log.end, end)
+            self.assertEqual(log.checkpoint("c"), end)
+
+    def test_repair_rejects_current_append_segment(self):
+        # Single-segment log: the only (last) segment is the append segment, so
+        # a damaged frame there is Corruption even in repair mode.
+        with RetainedJournal(self.dir) as log:
+            log.append(b"a" * 100)
+            log.append(b"b" * 100)
+        corrupt_body(self.dir, 4)
+        with self.assertRaises(Corruption):
+            RetainedJournal(self.dir, repair_mode=True)
 
 
 class ManifestContentTest(unittest.TestCase):
